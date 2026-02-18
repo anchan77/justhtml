@@ -288,4 +288,94 @@ mod tests {
         assert!(dt.system_id.is_none());
         assert!(!dt.force_quirks);
     }
+
+    #[test]
+    fn test_doctype_with_all_fields() {
+        let dt = Doctype {
+            name: Some("html".to_string()),
+            public_id: Some("-//W3C//DTD HTML 4.01//EN".to_string()),
+            system_id: Some("http://www.w3.org/TR/html4/strict.dtd".to_string()),
+            force_quirks: true,
+        };
+        assert_eq!(dt.name.as_deref(), Some("html"));
+        assert!(dt.force_quirks);
+    }
+
+    #[test]
+    fn test_parse_error_format_with_source_no_location() {
+        let error = ParseError::new("test-error", None, None, Some("message"), None, None);
+        assert_eq!(error.format_with_source(), "message");
+    }
+
+    #[test]
+    fn test_parse_error_format_with_source_with_location() {
+        let source = "<p>\x00</p>".to_string();
+        let error = ParseError::new(
+            "unexpected-null-character",
+            Some(1),
+            Some(4),
+            Some("Unexpected null character"),
+            Some(source),
+            None,
+        );
+        let formatted = error.format_with_source();
+        assert!(formatted.contains("line 1"), "Should contain line number, got: {}", formatted);
+        assert!(formatted.contains("^"), "Should contain caret, got: {}", formatted);
+        assert!(formatted.contains("ParseError"), "Should contain ParseError, got: {}", formatted);
+    }
+
+    #[test]
+    fn test_parse_error_format_with_source_multiline() {
+        let source = "line1\nline2\nline3\x00".to_string();
+        let error = ParseError::new(
+            "unexpected-null-character",
+            Some(3),
+            Some(6),
+            Some("Unexpected null character"),
+            Some(source),
+            None,
+        );
+        let formatted = error.format_with_source();
+        assert!(formatted.contains("line 3"), "Should reference line 3, got: {}", formatted);
+        assert!(formatted.contains("line3\x00"), "Should show the error line");
+    }
+
+    #[test]
+    fn test_parse_error_format_with_source_no_source() {
+        let error = ParseError::new("test", Some(1), Some(1), Some("msg"), None, None);
+        // No source_html → just returns message
+        assert_eq!(error.format_with_source(), "msg");
+    }
+
+    #[test]
+    fn test_parse_error_equality_different_locations() {
+        let e1 = ParseError::new("code", Some(1), Some(5), None, None, None);
+        let e2 = ParseError::new("code", Some(2), Some(5), None, None, None);
+        assert_ne!(e1, e2, "Different line should not be equal");
+    }
+
+    #[test]
+    fn test_tag_with_attrs() {
+        let mut attrs = HashMap::new();
+        attrs.insert("class".to_string(), Some("test".to_string()));
+        attrs.insert("id".to_string(), Some("main".to_string()));
+        attrs.insert("disabled".to_string(), None);
+
+        let tag = Tag::new(TagKind::Start, "div".to_string(), attrs, false);
+        assert_eq!(tag.attrs.get("class"), Some(&Some("test".to_string())));
+        assert_eq!(tag.attrs.get("disabled"), Some(&None));
+        assert_eq!(tag.attrs.len(), 3);
+    }
+
+    #[test]
+    fn test_character_tokens() {
+        let chars = CharacterTokens { data: "hello world".to_string() };
+        assert_eq!(chars.data, "hello world");
+    }
+
+    #[test]
+    fn test_comment_token() {
+        let comment = CommentToken { data: " comment text ".to_string() };
+        assert_eq!(comment.data, " comment text ");
+    }
 }

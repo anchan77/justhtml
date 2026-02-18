@@ -180,4 +180,72 @@ mod tests {
         let msg = generate_error_message("eof-in-comment", Some("div"));
         assert_eq!(msg, "Unexpected end of file in comment");
     }
+
+    #[test]
+    fn test_eof_in_doctype() {
+        let msg = generate_error_message("eof-in-doctype", None);
+        assert!(msg.to_lowercase().contains("eof") || msg.to_lowercase().contains("end of file"),
+            "eof-in-doctype message should mention EOF, got: {}", msg);
+        assert!(msg.to_lowercase().contains("doctype"),
+            "eof-in-doctype message should mention DOCTYPE, got: {}", msg);
+    }
+
+    #[test]
+    fn test_duplicate_attribute() {
+        let msg = generate_error_message("duplicate-attribute", None);
+        assert!(msg.to_lowercase().contains("duplicate"),
+            "duplicate-attribute message should mention 'duplicate', got: {}", msg);
+        assert!(msg.to_lowercase().contains("attribute"),
+            "duplicate-attribute message should mention 'attribute', got: {}", msg);
+    }
+
+    #[test]
+    fn test_eof_before_tag_name() {
+        let msg = generate_error_message("eof-before-tag-name", None);
+        assert!(msg.to_lowercase().contains("eof") || msg.to_lowercase().contains("end of file"),
+            "eof-before-tag-name message should mention EOF, got: {}", msg);
+    }
+
+    #[test]
+    fn test_missing_whitespace_between_attributes() {
+        let msg = generate_error_message("missing-whitespace-between-attributes", None);
+        assert!(msg.to_lowercase().contains("whitespace") || msg.to_lowercase().contains("missing"),
+            "missing-whitespace message should be descriptive, got: {}", msg);
+    }
+
+    #[test]
+    fn test_unexpected_equals_sign_before_attribute_name() {
+        let msg = generate_error_message("unexpected-equals-sign-before-attribute-name", None);
+        assert!(msg.to_lowercase().contains("=") || msg.to_lowercase().contains("equals"),
+            "unexpected-equals message should mention =, got: {}", msg);
+    }
+
+    #[test]
+    fn test_various_error_codes_produce_different_messages() {
+        // Ensure different error codes produce different messages
+        let codes = vec![
+            "eof-in-tag",
+            "eof-in-comment",
+            "eof-in-doctype",
+            "unexpected-null-character",
+            "duplicate-attribute",
+        ];
+        let messages: Vec<String> = codes.iter().map(|c| generate_error_message(c, None)).collect();
+        // Each should be unique
+        for i in 0..messages.len() {
+            for j in i + 1..messages.len() {
+                assert_ne!(messages[i], messages[j],
+                    "Error codes '{}' and '{}' should have different messages",
+                    codes[i], codes[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tag_name_formatting_start_vs_end() {
+        let start_msg = generate_error_message("unexpected-start-tag", Some("p"));
+        let end_msg = generate_error_message("unexpected-end-tag", Some("p"));
+        assert!(start_msg.contains("<p>"), "Start tag message should contain <p>");
+        assert!(end_msg.contains("</p>"), "End tag message should contain </p>");
+    }
 }
