@@ -8,7 +8,6 @@ mod states;
 
 use std::collections::HashMap;
 
-use crate::entities::decode_entities_in_text;
 use crate::errors::generate_error_message;
 use crate::tokens::{
     CharacterTokens, CommentToken, Doctype, DoctypeToken, EOFToken, ParseError, Tag, TagKind,
@@ -137,6 +136,7 @@ const RAWTEXT_SWITCH_TAGS: &[&str] = &[
 const RCDATA_ELEMENTS: &[&str] = &["title", "textarea"];
 
 /// Characters that terminate an unquoted attribute value.
+#[allow(dead_code)]
 const ATTR_VALUE_UNQUOTED_TERMINATORS: &[char] = &[
     '\t', '\n', '\x0C', ' ', '>', '"', '\'', '`', '=', '<',
 ];
@@ -307,6 +307,7 @@ impl Tokenizer {
     }
 
     /// Peek at the next character without consuming it.
+    #[allow(dead_code)]
     pub(crate) fn peek_char(&self, offset: usize) -> Option<char> {
         let target = self.pos + offset;
         if target >= self.length {
@@ -331,7 +332,7 @@ impl Tokenizer {
     /// Append text to the output buffer.
     pub(crate) fn append_text(&mut self, text: &str) {
         if self.text_buffer.is_empty() {
-            self.text_start_pos = if self.pos > 0 { self.pos - text.len() } else { 0 };
+            self.text_start_pos = self.pos.saturating_sub(text.len());
         }
         self.text_buffer.push_str(text);
     }
@@ -339,7 +340,7 @@ impl Tokenizer {
     /// Append a single character to the text buffer.
     pub(crate) fn append_text_char(&mut self, ch: char) {
         if self.text_buffer.is_empty() {
-            self.text_start_pos = if self.pos > 0 { self.pos - ch.len_utf8() } else { 0 };
+            self.text_start_pos = self.pos.saturating_sub(ch.len_utf8());
         }
         self.text_buffer.push(ch);
     }
