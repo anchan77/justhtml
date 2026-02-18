@@ -4,7 +4,6 @@
 
 #![allow(unused_variables)]
 
-use crate::entities::decode_entities_in_text;
 use crate::tokens::TagKind;
 
 use super::{TokenSink, Tokenizer, TokenizerState};
@@ -87,41 +86,57 @@ pub fn dispatch_state(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
 // ─── DATA state ──────────────────────────────────────────────────────────────
 
 fn state_data(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
-    match tok.get_char() {
-        Some('&') => {
-            // Character reference in data - consume entity
-            let decoded = consume_character_reference(tok, false);
-            tok.append_text(&decoded);
-            false
+    // Mirrors Python _state_data: collect text up to '<' or '\0',
+    // let flush_text handle entity decoding.
+    // NULL characters trigger errors and are replaced with U+FFFD.
+    loop {
+        if tok.reconsume {
+            tok.reconsume = false;
+            // Reconsume: back up one character
+            if tok.pos > 0 {
+                let s = &tok.buffer[..tok.pos];
+                if let Some((i, _)) = s.char_indices().next_back() {
+                    tok.pos = i;
+                }
+            }
         }
-        Some('<') => {
-            tok.state = TokenizerState::TagOpen;
-            false
+
+        if tok.pos >= tok.length {
+            tok.flush_text(sink);
+            tok.emit_eof(sink);
+            return true;
         }
-        Some('\0') => {
+
+        // Fast path: find next '<' or '\0' using find
+        let remaining = &tok.buffer[tok.pos..];
+        let next_special = remaining
+            .find(|c: char| c == '<' || c == '\0')
+            .map(|i| tok.pos + i)
+            .unwrap_or(tok.length);
+
+        // Collect text up to special char
+        if next_special > tok.pos {
+            let chunk = tok.buffer[tok.pos..next_special].to_string();
+            tok.append_text(&chunk);
+            tok.pos = next_special;
+            if tok.pos >= tok.length {
+                continue;
+            }
+        }
+
+        let c = tok.buffer[tok.pos..].chars().next().unwrap();
+        tok.pos += c.len_utf8();
+
+        if c == '\0' {
             tok.emit_error("unexpected-null-character");
             tok.append_text_char('\u{FFFD}');
-            false
+            continue;
         }
-        Some(c) => {
-            // Fast path: collect as many non-special characters as possible
-            let start = tok.pos - c.len_utf8();
-            let mut end = tok.pos;
-            while end < tok.length {
-                let next = tok.buffer[end..].chars().next().unwrap();
-                if next == '&' || next == '<' || next == '\0' {
-                    break;
-                }
-                end += next.len_utf8();
-            }
-            tok.append_text(&tok.buffer[start..end].to_string());
-            tok.pos = end;
-            false
-        }
-        None => {
-            tok.emit_eof(sink);
-            true
-        }
+
+        // At this point c is '<'
+        tok.flush_text(sink);
+        tok.state = TokenizerState::TagOpen;
+        return false;
     }
 }
 
@@ -388,40 +403,54 @@ fn state_before_attribute_value(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -
 // ─── ATTRIBUTE VALUE (double-quoted) state ──────────────────────────────────
 
 fn state_attribute_value_double(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
-    match tok.get_char() {
-        Some('"') => {
-            tok.state = TokenizerState::AfterAttributeValueQuoted;
-            false
-        }
-        Some('&') => {
-            let decoded = consume_character_reference(tok, true);
-            tok.append_attr_value_str(&decoded);
-            false
-        }
-        Some('\0') => {
-            tok.emit_error("unexpected-null-character");
-            tok.append_attr_value_char('\u{FFFD}');
-            false
-        }
-        Some(c) => {
-            tok.append_attr_value_char(c);
-            // Fast path
-            while tok.pos < tok.length {
-                let next = tok.buffer[tok.pos..].chars().next().unwrap();
-                match next {
-                    '"' | '&' | '\0' => break,
-                    _ => {
-                        tok.append_attr_value_char(next);
-                        tok.pos += next.len_utf8();
-                    }
-                }
+    // Mirrors Python: accumulate value including raw '&' chars.
+    // Entity decoding is deferred to finish_attribute.
+    loop {
+        let pos = tok.pos;
+        if pos < tok.length {
+            // Fast path: find next terminator (", &, \0)
+            let remaining = &tok.buffer[pos..];
+            let next_quote = remaining.find('"').map(|i| pos + i).unwrap_or(tok.length);
+            let chunk = &tok.buffer[pos..next_quote];
+            let end = if chunk.contains('&') || chunk.contains('\0') {
+                let mut e = next_quote;
+                if let Some(i) = chunk.find('&') { e = e.min(pos + i); }
+                if let Some(i) = chunk.find('\0') { e = e.min(pos + i); }
+                e
+            } else {
+                next_quote
+            };
+
+            if end > pos {
+                tok.current_attr_value.push_str(&tok.buffer[pos..end]);
+                tok.current_attr_has_value = true;
+                tok.pos = end;
             }
-            false
         }
-        None => {
+
+        if tok.pos >= tok.length {
             tok.emit_error("eof-in-tag");
             tok.emit_eof(sink);
-            true
+            return true;
+        }
+
+        let c = tok.buffer[tok.pos..].chars().next().unwrap();
+        tok.pos += c.len_utf8();
+
+        match c {
+            '"' => {
+                tok.state = TokenizerState::AfterAttributeValueQuoted;
+                return false;
+            }
+            '&' => {
+                tok.append_attr_value_char('&');
+                tok.current_attr_value_has_amp = true;
+            }
+            '\0' => {
+                tok.emit_error("unexpected-null-character");
+                tok.append_attr_value_char('\u{FFFD}');
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -429,39 +458,52 @@ fn state_attribute_value_double(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -
 // ─── ATTRIBUTE VALUE (single-quoted) state ──────────────────────────────────
 
 fn state_attribute_value_single(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
-    match tok.get_char() {
-        Some('\'') => {
-            tok.state = TokenizerState::AfterAttributeValueQuoted;
-            false
-        }
-        Some('&') => {
-            let decoded = consume_character_reference(tok, true);
-            tok.append_attr_value_str(&decoded);
-            false
-        }
-        Some('\0') => {
-            tok.emit_error("unexpected-null-character");
-            tok.append_attr_value_char('\u{FFFD}');
-            false
-        }
-        Some(c) => {
-            tok.append_attr_value_char(c);
-            while tok.pos < tok.length {
-                let next = tok.buffer[tok.pos..].chars().next().unwrap();
-                match next {
-                    '\'' | '&' | '\0' => break,
-                    _ => {
-                        tok.append_attr_value_char(next);
-                        tok.pos += next.len_utf8();
-                    }
-                }
+    // Mirrors Python: accumulate value including raw '&' chars.
+    loop {
+        let pos = tok.pos;
+        if pos < tok.length {
+            let remaining = &tok.buffer[pos..];
+            let next_quote = remaining.find('\'').map(|i| pos + i).unwrap_or(tok.length);
+            let chunk = &tok.buffer[pos..next_quote];
+            let end = if chunk.contains('&') || chunk.contains('\0') {
+                let mut e = next_quote;
+                if let Some(i) = chunk.find('&') { e = e.min(pos + i); }
+                if let Some(i) = chunk.find('\0') { e = e.min(pos + i); }
+                e
+            } else {
+                next_quote
+            };
+
+            if end > pos {
+                tok.current_attr_value.push_str(&tok.buffer[pos..end]);
+                tok.current_attr_has_value = true;
+                tok.pos = end;
             }
-            false
         }
-        None => {
+
+        if tok.pos >= tok.length {
             tok.emit_error("eof-in-tag");
             tok.emit_eof(sink);
-            true
+            return true;
+        }
+
+        let c = tok.buffer[tok.pos..].chars().next().unwrap();
+        tok.pos += c.len_utf8();
+
+        match c {
+            '\'' => {
+                tok.state = TokenizerState::AfterAttributeValueQuoted;
+                return false;
+            }
+            '&' => {
+                tok.append_attr_value_char('&');
+                tok.current_attr_value_has_amp = true;
+            }
+            '\0' => {
+                tok.emit_error("unexpected-null-character");
+                tok.append_attr_value_char('\u{FFFD}');
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -469,39 +511,72 @@ fn state_attribute_value_single(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -
 // ─── ATTRIBUTE VALUE (unquoted) state ───────────────────────────────────────
 
 fn state_attribute_value_unquoted(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
-    match tok.get_char() {
-        Some('\t') | Some('\n') | Some('\x0C') | Some(' ') => {
-            tok.state = TokenizerState::BeforeAttributeName;
-            false
+    // Mirrors Python: accumulate value including raw '&' chars.
+    loop {
+        // Fast path: skip non-terminator chars
+        if !tok.reconsume {
+            let pos = tok.pos;
+            if pos < tok.length {
+                // Find next terminator
+                let remaining = &tok.buffer[pos..];
+                let mut end = tok.length;
+                for (i, ch) in remaining.char_indices() {
+                    match ch {
+                        '\t' | '\n' | '\x0C' | ' ' | '>' | '&' | '"' | '\'' | '<' | '=' | '`' | '\0' => {
+                            end = pos + i;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if end > pos {
+                    tok.current_attr_value.push_str(&tok.buffer[pos..end]);
+                    tok.current_attr_has_value = true;
+                    tok.pos = end;
+                }
+            }
         }
-        Some('&') => {
-            let decoded = consume_character_reference(tok, true);
-            tok.append_attr_value_str(&decoded);
-            false
-        }
-        Some('>') => {
-            tok.state = TokenizerState::Data;
-            tok.emit_current_tag(sink);
-            false
-        }
-        Some('\0') => {
-            tok.emit_error("unexpected-null-character");
-            tok.append_attr_value_char('\u{FFFD}');
-            false
-        }
-        Some('"') | Some('\'') | Some('<') | Some('=') | Some('`') => {
-            tok.emit_error("unexpected-character-in-unquoted-attribute-value");
-            tok.append_attr_value_char(tok.buffer[tok.pos - 1..].chars().next().unwrap());
-            false
-        }
-        Some(c) => {
-            tok.append_attr_value_char(c);
-            false
-        }
-        None => {
-            tok.emit_error("eof-in-tag");
-            tok.emit_eof(sink);
-            true
+
+        match tok.get_char() {
+            None => {
+                tok.emit_error("eof-in-tag");
+                tok.emit_eof(sink);
+                return true;
+            }
+            Some(c) => match c {
+                '\t' | '\n' | '\x0C' | ' ' => {
+                    tok.finish_attribute();
+                    tok.state = TokenizerState::BeforeAttributeName;
+                    return false;
+                }
+                '>' => {
+                    tok.finish_attribute();
+                    tok.emit_current_tag(sink);
+                    if tok.state == TokenizerState::Data || tok.state == TokenizerState::Rcdata
+                        || tok.state == TokenizerState::Rawtext || tok.state == TokenizerState::Plaintext
+                        || tok.state == TokenizerState::ScriptData {
+                        // Already switched
+                    } else {
+                        tok.state = TokenizerState::Data;
+                    }
+                    return false;
+                }
+                '&' => {
+                    tok.append_attr_value_char('&');
+                    tok.current_attr_value_has_amp = true;
+                }
+                '"' | '\'' | '<' | '=' | '`' => {
+                    tok.emit_error("unexpected-character-in-unquoted-attribute-value");
+                    tok.append_attr_value_char(c);
+                }
+                '\0' => {
+                    tok.emit_error("unexpected-null-character");
+                    tok.append_attr_value_char('\u{FFFD}');
+                }
+                _ => {
+                    tok.append_attr_value_char(c);
+                }
+            }
         }
     }
 }
@@ -1362,39 +1437,66 @@ fn state_cdata_section_end(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> boo
 // ─── RCDATA states ───────────────────────────────────────────────────────────
 
 fn state_rcdata(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
-    match tok.get_char() {
-        Some('&') => {
-            let decoded = consume_character_reference(tok, false);
-            tok.append_text(&decoded);
-            false
-        }
-        Some('<') => {
-            tok.state = TokenizerState::RcdataLessThanSign;
-            false
-        }
-        Some('\0') => {
-            tok.emit_error("unexpected-null-character");
-            tok.append_text_char('\u{FFFD}');
-            false
-        }
-        Some(c) => {
-            tok.append_text_char(c);
-            // Fast path
-            while tok.pos < tok.length {
-                let next = tok.buffer[tok.pos..].chars().next().unwrap();
-                match next {
-                    '&' | '<' | '\0' => break,
-                    _ => {
-                        tok.append_text_char(next);
-                        tok.pos += next.len_utf8();
-                    }
+    // Mirrors Python _state_rcdata: collect text (including '&' for deferred entity decoding).
+    // NULL replaced with U+FFFD, '<' transitions to RCDATA_LESS_THAN_SIGN.
+    loop {
+        if tok.reconsume {
+            tok.reconsume = false;
+            if tok.pos > 0 {
+                let s = &tok.buffer[..tok.pos];
+                if let Some((i, _)) = s.char_indices().next_back() {
+                    tok.pos = i;
                 }
             }
-            false
         }
-        None => {
+
+        if tok.pos >= tok.length {
+            tok.flush_text(sink);
             tok.emit_eof(sink);
-            true
+            return true;
+        }
+
+        // Find the nearest special character (<, &, \0)
+        let remaining = &tok.buffer[tok.pos..];
+        let mut next_special = tok.length;
+        if let Some(i) = remaining.find('<') {
+            next_special = next_special.min(tok.pos + i);
+        }
+        if let Some(i) = remaining.find('&') {
+            next_special = next_special.min(tok.pos + i);
+        }
+        if let Some(i) = remaining.find('\0') {
+            next_special = next_special.min(tok.pos + i);
+        }
+
+        // Consume text up to the special character
+        if next_special > tok.pos {
+            let chunk = tok.buffer[tok.pos..next_special].to_string();
+            tok.append_text(&chunk);
+            tok.pos = next_special;
+        }
+
+        if tok.pos >= tok.length {
+            continue;
+        }
+
+        let c = tok.buffer[tok.pos..].chars().next().unwrap();
+        tok.pos += c.len_utf8();
+
+        match c {
+            '\0' => {
+                tok.emit_error("unexpected-null-character");
+                tok.append_text_char('\u{FFFD}');
+            }
+            '&' => {
+                // Accumulate ampersand; entity decoding is deferred to flush_text
+                tok.append_text_char('&');
+            }
+            '<' => {
+                tok.state = TokenizerState::RcdataLessThanSign;
+                return false;
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -1418,12 +1520,10 @@ fn state_rcdata_less_than_sign(tok: &mut Tokenizer, _sink: &mut dyn TokenSink) -
 fn state_rcdata_end_tag_open(tok: &mut Tokenizer, _sink: &mut dyn TokenSink) -> bool {
     match tok.get_char() {
         Some(c) if c.is_ascii_alphabetic() => {
-            tok.current_tag_kind = TagKind::End;
             tok.current_tag_name.clear();
-            tok.current_tag_attrs.clear();
-            tok.current_tag_self_closing = false;
-            tok.temp_buffer.clear();
-            tok.reconsume_current();
+            tok.current_tag_name.push(c.to_ascii_lowercase());
+            tok.original_tag_name.clear();
+            tok.original_tag_name.push(c);
             tok.state = TokenizerState::RcdataEndTagName;
             false
         }
@@ -1437,33 +1537,64 @@ fn state_rcdata_end_tag_open(tok: &mut Tokenizer, _sink: &mut dyn TokenSink) -> 
 }
 
 fn state_rcdata_end_tag_name(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
-    match tok.get_char() {
-        Some('\t') | Some('\n') | Some('\x0C') | Some(' ') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::BeforeAttributeName;
-            false
-        }
-        Some('/') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::SelfClosingStartTag;
-            false
-        }
-        Some('>') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::Data;
-            tok.emit_current_tag(sink);
-            false
-        }
-        Some(c) if c.is_ascii_alphabetic() => {
-            tok.temp_buffer.push(c.to_ascii_lowercase());
-            false
-        }
-        _ => {
-            tok.append_text("</");
-            tok.append_text(&tok.temp_buffer.clone());
-            tok.reconsume_current();
-            tok.state = TokenizerState::Rcdata;
-            false
+    // Mirrors Python: accumulate tag name, compare against rawtext_tag_name
+    loop {
+        match tok.get_char() {
+            Some(c) if c.is_ascii_alphabetic() => {
+                tok.current_tag_name.push(c.to_ascii_lowercase());
+                tok.original_tag_name.push(c);
+            }
+            other => {
+                let tag_name = tok.current_tag_name.clone();
+                let matches = tok.rawtext_tag_name.as_deref() == Some(tag_name.as_str());
+                if matches {
+                    match other {
+                        Some('>') => {
+                            let attrs = std::collections::HashMap::new();
+                            let tag = crate::tokens::Tag::new(TagKind::End, tag_name, attrs, false);
+                            tok.flush_text(sink);
+                            sink.process_token(crate::tokens::Token::Tag(tag));
+                            tok.state = TokenizerState::Data;
+                            tok.rawtext_tag_name = None;
+                            tok.original_tag_name.clear();
+                            return false;
+                        }
+                        Some('\t') | Some('\n') | Some('\x0C') | Some(' ') => {
+                            tok.current_tag_kind = TagKind::End;
+                            tok.current_tag_attrs.clear();
+                            tok.state = TokenizerState::BeforeAttributeName;
+                            return false;
+                        }
+                        Some('/') => {
+                            tok.flush_text(sink);
+                            tok.current_tag_kind = TagKind::End;
+                            tok.current_tag_attrs.clear();
+                            tok.state = TokenizerState::SelfClosingStartTag;
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+                // Not a matching end tag - emit as text (original case preserved)
+                if other.is_none() {
+                    tok.append_text("</");
+                    let orig = tok.original_tag_name.clone();
+                    tok.append_text(&orig);
+                    tok.current_tag_name.clear();
+                    tok.original_tag_name.clear();
+                    tok.flush_text(sink);
+                    tok.emit_eof(sink);
+                    return true;
+                }
+                tok.append_text("</");
+                let orig = tok.original_tag_name.clone();
+                tok.append_text(&orig);
+                tok.current_tag_name.clear();
+                tok.original_tag_name.clear();
+                tok.reconsume_current();
+                tok.state = TokenizerState::Rcdata;
+                return false;
+            }
         }
     }
 }
@@ -1471,33 +1602,69 @@ fn state_rcdata_end_tag_name(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> b
 // ─── RAWTEXT states ──────────────────────────────────────────────────────────
 
 fn state_rawtext(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
-    match tok.get_char() {
-        Some('<') => {
-            tok.state = TokenizerState::RawtextLessThanSign;
-            false
+    // Mirrors Python _state_rawtext with script escape detection.
+    // When rawtext_tag_name == "script" and we see "<!--", transition to ScriptDataEscaped.
+    loop {
+        if tok.pos >= tok.length {
+            tok.flush_text(sink);
+            tok.emit_eof(sink);
+            return true;
         }
-        Some('\0') => {
-            tok.emit_error("unexpected-null-character");
-            tok.append_text_char('\u{FFFD}');
-            false
-        }
-        Some(c) => {
-            tok.append_text_char(c);
-            while tok.pos < tok.length {
-                let next = tok.buffer[tok.pos..].chars().next().unwrap();
-                match next {
-                    '<' | '\0' => break,
-                    _ => {
-                        tok.append_text_char(next);
-                        tok.pos += next.len_utf8();
+
+        // Find next '<' or '\0'
+        let remaining = &tok.buffer[tok.pos..];
+        let lt_pos = remaining.find('<').map(|i| tok.pos + i);
+        let null_pos = remaining.find('\0').map(|i| tok.pos + i);
+
+        // Determine which comes first
+        let next_special = match (lt_pos, null_pos) {
+            (Some(l), Some(n)) => Some(l.min(n)),
+            (Some(l), None) => Some(l),
+            (None, Some(n)) => Some(n),
+            (None, None) => None,
+        };
+
+        match next_special {
+            None => {
+                // No special chars - consume rest as text
+                let chunk = tok.buffer[tok.pos..].to_string();
+                tok.append_text(&chunk);
+                tok.pos = tok.length;
+                // Loop back to EOF handling
+            }
+            Some(sp) => {
+                // Consume text up to special char
+                if sp > tok.pos {
+                    let chunk = tok.buffer[tok.pos..sp].to_string();
+                    tok.append_text(&chunk);
+                    tok.pos = sp;
+                }
+
+                let c = tok.buffer[tok.pos..].chars().next().unwrap();
+                tok.pos += c.len_utf8();
+
+                if c == '\0' {
+                    tok.emit_error("unexpected-null-character");
+                    tok.append_text_char('\u{FFFD}');
+                    // Continue loop
+                } else {
+                    // c == '<'
+                    // Script escape detection
+                    if tok.rawtext_tag_name.as_deref() == Some("script") {
+                        if tok.pos + 2 < tok.length {
+                            let peek = &tok.buffer[tok.pos..tok.pos + 3];
+                            if peek == "!--" {
+                                tok.append_text("<!--");
+                                tok.pos += 3;
+                                tok.state = TokenizerState::ScriptDataEscaped;
+                                return false;
+                            }
+                        }
                     }
+                    tok.state = TokenizerState::RawtextLessThanSign;
+                    return false;
                 }
             }
-            false
-        }
-        None => {
-            tok.emit_eof(sink);
-            true
         }
     }
 }
@@ -1521,12 +1688,10 @@ fn state_rawtext_less_than_sign(tok: &mut Tokenizer, _sink: &mut dyn TokenSink) 
 fn state_rawtext_end_tag_open(tok: &mut Tokenizer, _sink: &mut dyn TokenSink) -> bool {
     match tok.get_char() {
         Some(c) if c.is_ascii_alphabetic() => {
-            tok.current_tag_kind = TagKind::End;
             tok.current_tag_name.clear();
-            tok.current_tag_attrs.clear();
-            tok.current_tag_self_closing = false;
-            tok.temp_buffer.clear();
-            tok.reconsume_current();
+            tok.current_tag_name.push(c.to_ascii_lowercase());
+            tok.original_tag_name.clear();
+            tok.original_tag_name.push(c);
             tok.state = TokenizerState::RawtextEndTagName;
             false
         }
@@ -1540,33 +1705,64 @@ fn state_rawtext_end_tag_open(tok: &mut Tokenizer, _sink: &mut dyn TokenSink) ->
 }
 
 fn state_rawtext_end_tag_name(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
-    match tok.get_char() {
-        Some('\t') | Some('\n') | Some('\x0C') | Some(' ') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::BeforeAttributeName;
-            false
-        }
-        Some('/') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::SelfClosingStartTag;
-            false
-        }
-        Some('>') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::Data;
-            tok.emit_current_tag(sink);
-            false
-        }
-        Some(c) if c.is_ascii_alphabetic() => {
-            tok.temp_buffer.push(c.to_ascii_lowercase());
-            false
-        }
-        _ => {
-            tok.append_text("</");
-            tok.append_text(&tok.temp_buffer.clone());
-            tok.reconsume_current();
-            tok.state = TokenizerState::Rawtext;
-            false
+    // Mirrors Python: accumulate tag name, compare against rawtext_tag_name
+    loop {
+        match tok.get_char() {
+            Some(c) if c.is_ascii_alphabetic() => {
+                tok.current_tag_name.push(c.to_ascii_lowercase());
+                tok.original_tag_name.push(c);
+            }
+            other => {
+                let tag_name = tok.current_tag_name.clone();
+                let matches = tok.rawtext_tag_name.as_deref() == Some(tag_name.as_str());
+                if matches {
+                    match other {
+                        Some('>') => {
+                            let attrs = std::collections::HashMap::new();
+                            let tag = crate::tokens::Tag::new(TagKind::End, tag_name, attrs, false);
+                            tok.flush_text(sink);
+                            sink.process_token(crate::tokens::Token::Tag(tag));
+                            tok.state = TokenizerState::Data;
+                            tok.rawtext_tag_name = None;
+                            tok.original_tag_name.clear();
+                            return false;
+                        }
+                        Some('\t') | Some('\n') | Some('\x0C') | Some(' ') => {
+                            tok.current_tag_kind = TagKind::End;
+                            tok.current_tag_attrs.clear();
+                            tok.state = TokenizerState::BeforeAttributeName;
+                            return false;
+                        }
+                        Some('/') => {
+                            tok.flush_text(sink);
+                            tok.current_tag_kind = TagKind::End;
+                            tok.current_tag_attrs.clear();
+                            tok.state = TokenizerState::SelfClosingStartTag;
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+                // Not a matching end tag - emit as text (original case preserved)
+                if other.is_none() {
+                    tok.append_text("</");
+                    let orig = tok.original_tag_name.clone();
+                    tok.append_text(&orig);
+                    tok.current_tag_name.clear();
+                    tok.original_tag_name.clear();
+                    tok.flush_text(sink);
+                    tok.emit_eof(sink);
+                    return true;
+                }
+                tok.append_text("</");
+                let orig = tok.original_tag_name.clone();
+                tok.append_text(&orig);
+                tok.current_tag_name.clear();
+                tok.original_tag_name.clear();
+                tok.reconsume_current();
+                tok.state = TokenizerState::Rawtext;
+                return false;
+            }
         }
     }
 }
@@ -1803,12 +1999,13 @@ fn state_script_data_escaped_dash_dash(tok: &mut Tokenizer, sink: &mut dyn Token
             false
         }
         Some('<') => {
+            tok.append_text_char('<');
             tok.state = TokenizerState::ScriptDataEscapedLessThanSign;
             false
         }
         Some('>') => {
             tok.append_text_char('>');
-            tok.state = TokenizerState::ScriptData;
+            tok.state = TokenizerState::Rawtext;
             false
         }
         Some('\0') => {
@@ -1856,10 +2053,8 @@ fn state_script_data_escaped_less_than_sign(tok: &mut Tokenizer, _sink: &mut dyn
 fn state_script_data_escaped_end_tag_open(tok: &mut Tokenizer, _sink: &mut dyn TokenSink) -> bool {
     match tok.get_char() {
         Some(c) if c.is_ascii_alphabetic() => {
-            tok.current_tag_kind = TagKind::End;
             tok.current_tag_name.clear();
-            tok.current_tag_attrs.clear();
-            tok.current_tag_self_closing = false;
+            tok.original_tag_name.clear();
             tok.temp_buffer.clear();
             tok.reconsume_current();
             tok.state = TokenizerState::ScriptDataEscapedEndTagName;
@@ -1875,30 +2070,51 @@ fn state_script_data_escaped_end_tag_open(tok: &mut Tokenizer, _sink: &mut dyn T
 }
 
 fn state_script_data_escaped_end_tag_name(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
+    // Mirrors Python _state_script_data_escaped_end_tag_name
     match tok.get_char() {
-        Some('\t') | Some('\n') | Some('\x0C') | Some(' ') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::BeforeAttributeName;
-            false
-        }
-        Some('/') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::SelfClosingStartTag;
-            false
-        }
-        Some('>') if tok.is_appropriate_end_tag() => {
-            tok.current_tag_name = tok.temp_buffer.clone();
-            tok.state = TokenizerState::Data;
-            tok.emit_current_tag(sink);
-            false
-        }
         Some(c) if c.is_ascii_alphabetic() => {
-            tok.temp_buffer.push(c.to_ascii_lowercase());
+            tok.current_tag_name.push(c.to_ascii_lowercase());
+            tok.original_tag_name.push(c);
+            tok.temp_buffer.push(c);
             false
         }
-        _ => {
+        other => {
+            let tag_name = tok.current_tag_name.clone();
+            let is_appropriate = tok.rawtext_tag_name.as_deref() == Some(tag_name.as_str());
+
+            if is_appropriate {
+                match other {
+                    Some('\t') | Some('\n') | Some('\x0C') | Some(' ') => {
+                        tok.current_tag_kind = TagKind::End;
+                        tok.current_tag_attrs.clear();
+                        tok.state = TokenizerState::BeforeAttributeName;
+                        return false;
+                    }
+                    Some('/') => {
+                        tok.flush_text(sink);
+                        tok.current_tag_kind = TagKind::End;
+                        tok.current_tag_attrs.clear();
+                        tok.state = TokenizerState::SelfClosingStartTag;
+                        return false;
+                    }
+                    Some('>') => {
+                        tok.flush_text(sink);
+                        let attrs = std::collections::HashMap::new();
+                        let tag = crate::tokens::Tag::new(TagKind::End, tag_name, attrs, false);
+                        sink.process_token(crate::tokens::Token::Tag(tag));
+                        tok.state = TokenizerState::Data;
+                        tok.rawtext_tag_name = None;
+                        tok.current_tag_name.clear();
+                        tok.original_tag_name.clear();
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            // Not appropriate - emit as text
             tok.append_text("</");
-            tok.append_text(&tok.temp_buffer.clone());
+            let temp = tok.temp_buffer.clone();
+            tok.append_text(&temp);
             tok.reconsume_current();
             tok.state = TokenizerState::ScriptDataEscaped;
             false
@@ -2003,7 +2219,7 @@ fn state_script_data_double_escaped_dash_dash(tok: &mut Tokenizer, sink: &mut dy
         }
         Some('>') => {
             tok.append_text_char('>');
-            tok.state = TokenizerState::ScriptData;
+            tok.state = TokenizerState::Rawtext;
             false
         }
         Some('\0') => {
@@ -2031,6 +2247,12 @@ fn state_script_data_double_escaped_less_than_sign(tok: &mut Tokenizer, _sink: &
             tok.temp_buffer.clear();
             tok.append_text_char('/');
             tok.state = TokenizerState::ScriptDataDoubleEscapeEnd;
+            false
+        }
+        Some(c) if c.is_ascii_alphabetic() => {
+            tok.temp_buffer.clear();
+            tok.reconsume_current();
+            tok.state = TokenizerState::ScriptDataDoubleEscapeStart;
             false
         }
         _ => {
@@ -2065,42 +2287,3 @@ fn state_script_data_double_escape_end(tok: &mut Tokenizer, _sink: &mut dyn Toke
     }
 }
 
-// ─── Character reference consumption ─────────────────────────────────────────
-
-/// Consume a character reference starting after '&'.
-/// Returns the decoded string.
-fn consume_character_reference(tok: &mut Tokenizer, in_attribute: bool) -> String {
-    // Collect the entity reference text
-    let start = tok.pos;
-    let mut entity_text = String::from("&");
-
-    // Read until we find ; or a non-entity character
-    let mut end = tok.pos;
-    let buf = &tok.buffer[tok.pos..];
-
-    for (i, ch) in buf.char_indices() {
-        if ch == ';' {
-            end = tok.pos + i + 1;
-            entity_text.push_str(&buf[..i + 1]);
-            break;
-        }
-        if !ch.is_ascii_alphanumeric() && ch != '#' && ch != 'x' && ch != 'X' {
-            end = tok.pos + i;
-            entity_text.push_str(&buf[..i]);
-            break;
-        }
-        if i + ch.len_utf8() >= buf.len() {
-            end = tok.pos + i + ch.len_utf8();
-            entity_text.push_str(&buf[..i + ch.len_utf8()]);
-            break;
-        }
-    }
-
-    if entity_text.len() <= 1 {
-        // Just "&" with nothing after it
-        return "&".to_string();
-    }
-
-    tok.pos = end;
-    decode_entities_in_text(&entity_text, in_attribute)
-}

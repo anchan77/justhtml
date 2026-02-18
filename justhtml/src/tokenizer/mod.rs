@@ -8,9 +8,10 @@ mod states;
 
 use std::collections::HashMap;
 
+use crate::entities::decode_entities_in_text;
 use crate::errors::generate_error_message;
 use crate::tokens::{
-    CharacterTokens, CommentToken, Doctype, DoctypeToken, EOFToken, ParseError, Tag, TagKind,
+    CommentToken, Doctype, DoctypeToken, EOFToken, ParseError, Tag, TagKind,
     Token, TokenSinkResult,
 };
 
@@ -127,12 +128,14 @@ pub enum TokenizerState {
     NumericCharacterReference = 69,
 }
 
-/// Tags that switch the tokenizer to RAWTEXT mode.
+/// Tags that may switch the tokenizer to RAWTEXT/RCDATA/ScriptData/Plaintext mode.
+/// This mirrors the Python `_RAWTEXT_SWITCH_TAGS` set used to decide if we need a
+/// rawtext check.
 const RAWTEXT_SWITCH_TAGS: &[&str] = &[
-    "style", "script", "xmp", "iframe", "noembed", "noframes", "noscript", "plaintext",
+    "script", "style", "xmp", "iframe", "noembed", "noframes", "textarea", "title",
 ];
 
-/// RCDATA elements.
+/// RCDATA elements (subset of RAWTEXT_SWITCH_TAGS that use RCDATA mode).
 const RCDATA_ELEMENTS: &[&str] = &["title", "textarea"];
 
 /// Characters that terminate an unquoted attribute value.
@@ -159,6 +162,7 @@ pub struct Tokenizer {
     current_attr_name: String,
     current_attr_value: String,
     current_attr_has_value: bool,
+    current_attr_value_has_amp: bool,
     current_tag_self_closing: bool,
     current_comment: String,
     current_doctype_name: Option<String>,
@@ -169,6 +173,10 @@ pub struct Tokenizer {
     // Text accumulation
     text_buffer: String,
     temp_buffer: String,
+
+    // Original (unfolded) tag name for RCDATA/RAWTEXT end tag recovery
+    #[allow(dead_code)]
+    original_tag_name: String,
 
     // Tag matching
     last_start_tag_name: Option<String>,
@@ -210,6 +218,7 @@ impl Tokenizer {
             current_attr_name: String::new(),
             current_attr_value: String::new(),
             current_attr_has_value: false,
+            current_attr_value_has_amp: false,
             current_tag_self_closing: false,
             current_comment: String::new(),
             current_doctype_name: None,
@@ -218,6 +227,7 @@ impl Tokenizer {
             current_doctype_force_quirks: false,
             text_buffer: String::new(),
             temp_buffer: String::new(),
+            original_tag_name: String::new(),
             last_start_tag_name: rawtext_tag.clone(),
             rawtext_tag_name: rawtext_tag,
             opts,
@@ -346,51 +356,82 @@ impl Tokenizer {
     }
 
     /// Flush accumulated text to the sink.
+    /// Mirrors Python's `_flush_text`: decodes character references for DATA/RCDATA
+    /// but NOT for RAWTEXT, PLAINTEXT, or CDATA states.
     pub(crate) fn flush_text(&mut self, sink: &mut dyn TokenSink) -> TokenSinkResult {
         if self.text_buffer.is_empty() {
             return TokenSinkResult::Continue;
         }
 
-        let text = std::mem::take(&mut self.text_buffer);
+        let mut data = std::mem::take(&mut self.text_buffer);
+
+        // Decode character references based on current state (matching Python _flush_text).
+        // RAWTEXT (>=44), PLAINTEXT (>=48), CDATA (37-39) states do NOT decode.
+        let state_val = self.state as u8;
+        let is_rawtext_or_above = state_val >= TokenizerState::Rawtext as u8;
+        let is_cdata = (TokenizerState::CdataSection as u8..=TokenizerState::CdataSectionEnd as u8)
+            .contains(&state_val);
+
+        if !is_rawtext_or_above && !is_cdata {
+            if data.contains('&') {
+                data = decode_entities_in_text(&data, false);
+            }
+        }
 
         // Apply XML coercion if needed
-        let text = if self.opts.xml_coercion {
-            coerce_text_for_xml(&text)
+        let data = if self.opts.xml_coercion {
+            coerce_text_for_xml(&data)
         } else {
-            text
+            data
         };
 
-        let result = sink.process_token(Token::Characters(CharacterTokens::new(text)));
-        result
+        // Record position
+        if self.collect_errors {
+            self.record_token_position();
+        }
+
+        sink.process_characters(&data)
     }
 
     // ─── Attribute handling ──────────────────────────────────────────────
 
     /// Finish the current attribute and add it to the tag.
+    /// Mirrors Python's `_finish_attribute`: decodes entities in the value if
+    /// `current_attr_value_has_amp` is true.
     pub(crate) fn finish_attribute(&mut self) {
         if self.current_attr_name.is_empty() {
             return;
         }
 
         let name = std::mem::take(&mut self.current_attr_name);
-        let value = if self.current_attr_has_value {
-            Some(std::mem::take(&mut self.current_attr_value))
-        } else {
-            self.current_attr_value.clear();
-            None
-        };
 
-        // Check for duplicate
+        // Check for duplicate first
         let is_dup = self.current_tag_attrs.iter().any(|(n, _)| n == &name);
         if is_dup {
             if self.collect_errors {
                 self.emit_error("duplicate-attribute");
             }
-        } else {
-            self.current_tag_attrs.push((name, value));
+            self.current_attr_value.clear();
+            self.current_attr_has_value = false;
+            self.current_attr_value_has_amp = false;
+            return;
         }
 
+        let value = if self.current_attr_has_value {
+            let mut val = std::mem::take(&mut self.current_attr_value);
+            // Decode entities in attribute value (deferred from parsing time)
+            if self.current_attr_value_has_amp {
+                val = decode_entities_in_text(&val, true);
+            }
+            Some(val)
+        } else {
+            self.current_attr_value.clear();
+            None
+        };
+
+        self.current_tag_attrs.push((name, value));
         self.current_attr_has_value = false;
+        self.current_attr_value_has_amp = false;
     }
 
     /// Append a character to the current attribute value.
@@ -400,6 +441,7 @@ impl Tokenizer {
     }
 
     /// Append a string to the current attribute value.
+    #[allow(dead_code)]
     pub(crate) fn append_attr_value_str(&mut self, s: &str) {
         self.current_attr_has_value = true;
         self.current_attr_value.push_str(s);
@@ -435,38 +477,44 @@ impl Tokenizer {
 
         let result = sink.process_token(Token::Tag(tag));
 
-        // Check if we should switch to rawtext/rcdata mode
+        // Check if we should switch to rawtext/rcdata mode.
+        // Python checks `self.sink.open_elements` for namespace, but here we
+        // just check whether the name is in the rawtext switch set. The tree builder
+        // (Milestone 2) will refine this with namespace awareness.
+        let mut switched_to_rawtext = false;
+
         if kind == TagKind::Start {
             if result == TokenSinkResult::Plaintext {
                 self.state = TokenizerState::Plaintext;
-                return true;
-            }
-
-            if RCDATA_ELEMENTS.contains(&name.as_str()) {
-                self.state = TokenizerState::Rcdata;
-                self.rawtext_tag_name = Some(name);
-                return true;
-            }
-
-            if name == "script" {
-                self.state = TokenizerState::ScriptData;
-                self.rawtext_tag_name = Some(name);
-                return true;
-            }
-
-            if RAWTEXT_SWITCH_TAGS.contains(&name.as_str()) && name != "script" && name != "plaintext" {
-                self.state = TokenizerState::Rawtext;
-                self.rawtext_tag_name = Some(name);
-                return true;
-            }
-
-            if name == "plaintext" {
-                self.state = TokenizerState::Plaintext;
-                return true;
+                switched_to_rawtext = true;
+            } else {
+                let needs_rawtext_check = RAWTEXT_SWITCH_TAGS.contains(&name.as_str()) || name == "plaintext";
+                if needs_rawtext_check {
+                    if RCDATA_ELEMENTS.contains(&name.as_str()) {
+                        self.state = TokenizerState::Rcdata;
+                        self.rawtext_tag_name = Some(name);
+                        switched_to_rawtext = true;
+                    } else if name == "script" {
+                        // Script uses "RAWTEXT" mode in the Python implementation
+                        // (which includes special escape handling via `_state_rawtext` that
+                        // checks rawtext_tag_name == "script")
+                        self.state = TokenizerState::Rawtext;
+                        self.rawtext_tag_name = Some(name);
+                        switched_to_rawtext = true;
+                    } else if name == "plaintext" {
+                        self.state = TokenizerState::Plaintext;
+                        switched_to_rawtext = true;
+                    } else {
+                        // style, xmp, iframe, noembed, noframes
+                        self.state = TokenizerState::Rawtext;
+                        self.rawtext_tag_name = Some(name);
+                        switched_to_rawtext = true;
+                    }
+                }
             }
         }
 
-        false
+        switched_to_rawtext
     }
 
     /// Emit a comment token.
@@ -710,7 +758,9 @@ mod tests {
         let mut tok = Tokenizer::new(None, false);
         let mut sink = CollectorSink::new();
         tok.run("<!DOCTYPE html>", &mut sink);
-        assert!(sink.tokens.iter().any(|t| t == "doctype:html"));
+        eprintln!("DOCTYPE test tokens: {:?}", sink.tokens);
+        assert!(sink.tokens.iter().any(|t| t == "doctype:html"),
+            "Expected 'doctype:html' but got: {:?}", sink.tokens);
     }
 
     #[test]
@@ -743,7 +793,7 @@ mod tests {
         let mut sink = CollectorSink::new();
         tok.run("a\r\nb\rc", &mut sink);
         // After normalization, \r\n -> \n and \r -> \n
-        let text_tokens: Vec<&String> = sink.tokens.iter().filter(|t| t.starts_with("text:")).collect();
+        let text_tokens: Vec<&String> = sink.tokens.iter().filter(|t| t.starts_with("chars:")).collect();
         // Should have normalized text
         assert!(text_tokens.iter().any(|t| t.contains("a\nb\nc")));
     }
