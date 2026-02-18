@@ -1,0 +1,14 @@
+[package]
+name = "justhtml-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "CLI for the justhtml HTML5 parser"
+
+[[bin]]
+name = "justhtml"
+path = "src/main.rs"
+
+[dependencies]
+justhtml = { path = "../justhtml" }
+clap.workspace = true
