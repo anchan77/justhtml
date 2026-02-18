@@ -1,0 +1,14 @@
+[package]
+name = "justhtml"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "A pure-Rust HTML5 parser"
+
+[dependencies]
+encoding_rs.workspace = true
+phf.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
