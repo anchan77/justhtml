@@ -971,13 +971,16 @@ fn state_after_doctype_name(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bo
         }
         Some(_) => {
             // Check for PUBLIC or SYSTEM
-            tok.reconsume_current();
+            // Move pos back to before the character we just consumed so
+            // consume_case_insensitive reads from the correct position.
+            tok.pos = tok.prev_char_pos();
+            tok.reconsume = false;
             if tok.consume_case_insensitive("PUBLIC") {
                 tok.state = TokenizerState::AfterDoctypePublicKeyword;
             } else if tok.consume_case_insensitive("SYSTEM") {
                 tok.state = TokenizerState::AfterDoctypeSystemKeyword;
             } else {
-                tok.get_char(); // consume the character we reconsumed
+                tok.get_char(); // consume the character
                 tok.emit_error("expected-doctype-name-but-got-right-bracket");
                 tok.current_doctype_force_quirks = true;
                 tok.state = TokenizerState::BogusDoctype;
@@ -1605,6 +1608,17 @@ fn state_rawtext(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> bool {
     // Mirrors Python _state_rawtext with script escape detection.
     // When rawtext_tag_name == "script" and we see "<!--", transition to ScriptDataEscaped.
     loop {
+        // Handle reconsume flag (set when returning from sub-states like RawtextLessThanSign)
+        if tok.reconsume {
+            tok.reconsume = false;
+            if tok.pos > 0 {
+                let s = &tok.buffer[..tok.pos];
+                if let Some((i, _)) = s.char_indices().next_back() {
+                    tok.pos = i;
+                }
+            }
+        }
+
         if tok.pos >= tok.length {
             tok.flush_text(sink);
             tok.emit_eof(sink);

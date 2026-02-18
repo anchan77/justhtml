@@ -332,7 +332,7 @@ impl Tokenizer {
     }
 
     /// Get byte position of the character before current pos.
-    fn prev_char_pos(&self) -> usize {
+    pub(crate) fn prev_char_pos(&self) -> usize {
         let s = &self.buffer[..self.pos];
         s.char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
     }
@@ -808,5 +808,733 @@ mod tests {
     fn test_xml_coercion_comment() {
         assert_eq!(coerce_comment_for_xml("no dashes"), "no dashes");
         assert_eq!(coerce_comment_for_xml("a--b"), "a- -b");
+    }
+
+    // ─── Extended tokenizer tests ────────────────────────────────────────────
+
+    /// A richer test sink that captures full token details for assertions.
+    struct DetailedSink {
+        events: Vec<TokenEvent>,
+    }
+
+    #[derive(Debug, Clone)]
+    enum TokenEvent {
+        StartTag { name: String, attrs: HashMap<String, Option<String>>, self_closing: bool },
+        EndTag { name: String },
+        Characters(String),
+        Comment(String),
+        Doctype { name: Option<String>, public_id: Option<String>, system_id: Option<String>, force_quirks: bool },
+        Eof,
+    }
+
+    impl DetailedSink {
+        fn new() -> Self {
+            Self { events: Vec::new() }
+        }
+        fn start_tags(&self) -> Vec<&str> {
+            self.events.iter().filter_map(|e| match e {
+                TokenEvent::StartTag { name, .. } => Some(name.as_str()),
+                _ => None,
+            }).collect()
+        }
+        fn end_tags(&self) -> Vec<&str> {
+            self.events.iter().filter_map(|e| match e {
+                TokenEvent::EndTag { name, .. } => Some(name.as_str()),
+                _ => None,
+            }).collect()
+        }
+        fn all_text(&self) -> String {
+            self.events.iter().filter_map(|e| match e {
+                TokenEvent::Characters(s) => Some(s.as_str()),
+                _ => None,
+            }).collect::<Vec<_>>().join("")
+        }
+        fn comments(&self) -> Vec<&str> {
+            self.events.iter().filter_map(|e| match e {
+                TokenEvent::Comment(data) => Some(data.as_str()),
+                _ => None,
+            }).collect()
+        }
+        fn doctypes(&self) -> Vec<&TokenEvent> {
+            self.events.iter().filter(|e| matches!(e, TokenEvent::Doctype { .. })).collect()
+        }
+    }
+
+    impl TokenSink for DetailedSink {
+        fn process_token(&mut self, token: Token) -> TokenSinkResult {
+            match token {
+                Token::Tag(tag) => {
+                    if tag.kind == TagKind::Start {
+                        self.events.push(TokenEvent::StartTag {
+                            name: tag.name.clone(),
+                            attrs: tag.attrs.clone(),
+                            self_closing: tag.self_closing,
+                        });
+                    } else {
+                        self.events.push(TokenEvent::EndTag { name: tag.name.clone() });
+                    }
+                }
+                Token::Characters(chars) => {
+                    self.events.push(TokenEvent::Characters(chars.data.clone()));
+                }
+                Token::Comment(c) => {
+                    self.events.push(TokenEvent::Comment(c.data.clone()));
+                }
+                Token::Doctype(dt) => {
+                    self.events.push(TokenEvent::Doctype {
+                        name: dt.doctype.name.clone(),
+                        public_id: dt.doctype.public_id.clone(),
+                        system_id: dt.doctype.system_id.clone(),
+                        force_quirks: dt.doctype.force_quirks,
+                    });
+                }
+                Token::EOF(_) => {
+                    self.events.push(TokenEvent::Eof);
+                }
+            }
+            TokenSinkResult::Continue
+        }
+
+        fn process_characters(&mut self, data: &str) -> TokenSinkResult {
+            self.events.push(TokenEvent::Characters(data.to_string()));
+            TokenSinkResult::Continue
+        }
+    }
+
+    fn tokenize(html: &str) -> DetailedSink {
+        let mut tok = Tokenizer::new(None, false);
+        let mut sink = DetailedSink::new();
+        tok.run(html, &mut sink);
+        sink
+    }
+
+    fn tokenize_with_errors(html: &str) -> (DetailedSink, Vec<ParseError>) {
+        let mut tok = Tokenizer::new(None, true);
+        let mut sink = DetailedSink::new();
+        tok.run(html, &mut sink);
+        (sink, tok.errors)
+    }
+
+    // ─── DOCTYPE tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_doctype_html5() {
+        let sink = tokenize("<!DOCTYPE html>");
+        let dts = sink.doctypes();
+        assert_eq!(dts.len(), 1);
+        match &dts[0] {
+            TokenEvent::Doctype { name, public_id, system_id, force_quirks } => {
+                assert_eq!(name.as_deref(), Some("html"));
+                assert!(public_id.is_none());
+                assert!(system_id.is_none());
+                assert!(!force_quirks);
+            }
+            _ => panic!("expected doctype"),
+        }
+    }
+
+    #[test]
+    fn test_doctype_case_insensitive() {
+        let sink = tokenize("<!doctype HTML>");
+        let dts = sink.doctypes();
+        assert_eq!(dts.len(), 1);
+        match &dts[0] {
+            TokenEvent::Doctype { name, .. } => {
+                assert_eq!(name.as_deref(), Some("html"));
+            }
+            _ => panic!("expected doctype"),
+        }
+    }
+
+    #[test]
+    fn test_doctype_with_public_id() {
+        let sink = tokenize(
+            r#"<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN">"#,
+        );
+        let dts = sink.doctypes();
+        assert_eq!(dts.len(), 1);
+        match &dts[0] {
+            TokenEvent::Doctype { name, public_id, .. } => {
+                assert_eq!(name.as_deref(), Some("html"));
+                assert_eq!(public_id.as_deref(), Some("-//W3C//DTD HTML 4.01//EN"));
+            }
+            _ => panic!("expected doctype"),
+        }
+    }
+
+    #[test]
+    fn test_doctype_with_public_and_system_id() {
+        let sink = tokenize(
+            r#"<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">"#,
+        );
+        let dts = sink.doctypes();
+        assert_eq!(dts.len(), 1);
+        match &dts[0] {
+            TokenEvent::Doctype { name, public_id, system_id, .. } => {
+                assert_eq!(name.as_deref(), Some("html"));
+                assert_eq!(public_id.as_deref(), Some("-//W3C//DTD HTML 4.01//EN"));
+                assert_eq!(system_id.as_deref(), Some("http://www.w3.org/TR/html4/strict.dtd"));
+            }
+            _ => panic!("expected doctype"),
+        }
+    }
+
+    #[test]
+    fn test_doctype_system_only() {
+        let sink = tokenize(
+            r#"<!DOCTYPE html SYSTEM "about:legacy-compat">"#,
+        );
+        let dts = sink.doctypes();
+        assert_eq!(dts.len(), 1);
+        match &dts[0] {
+            TokenEvent::Doctype { name, public_id, system_id, .. } => {
+                assert_eq!(name.as_deref(), Some("html"));
+                assert!(public_id.is_none());
+                assert_eq!(system_id.as_deref(), Some("about:legacy-compat"));
+            }
+            _ => panic!("expected doctype"),
+        }
+    }
+
+    #[test]
+    fn test_doctype_force_quirks_missing_name() {
+        let (sink, errors) = tokenize_with_errors("<!DOCTYPE >");
+        let dts = sink.doctypes();
+        assert_eq!(dts.len(), 1);
+        match &dts[0] {
+            TokenEvent::Doctype { force_quirks, .. } => {
+                assert!(*force_quirks);
+            }
+            _ => panic!("expected doctype"),
+        }
+        assert!(!errors.is_empty());
+    }
+
+    // ─── Comment tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_comment_basic() {
+        let sink = tokenize("<!-- hello -->");
+        assert_eq!(sink.comments(), vec![" hello "]);
+    }
+
+    #[test]
+    fn test_comment_empty() {
+        let sink = tokenize("<!---->");
+        assert_eq!(sink.comments(), vec![""]);
+    }
+
+    #[test]
+    fn test_comment_with_dashes() {
+        let sink = tokenize("<!-- a -- b -->");
+        let comments = sink.comments();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0], " a -- b ");
+    }
+
+    #[test]
+    fn test_comment_abrupt_closing() {
+        let (sink, errors) = tokenize_with_errors("<!-->");
+        assert_eq!(sink.comments(), vec![""]);
+        assert!(errors.iter().any(|e| e.code == "abrupt-closing-of-empty-comment"));
+    }
+
+    #[test]
+    fn test_multiple_comments() {
+        let sink = tokenize("<!-- a -->text<!-- b -->");
+        assert_eq!(sink.comments(), vec![" a ", " b "]);
+        assert_eq!(sink.all_text(), "text");
+    }
+
+    // ─── Tag tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_nested_tags() {
+        let sink = tokenize("<div><p>text</p></div>");
+        assert_eq!(sink.start_tags(), vec!["div", "p"]);
+        assert_eq!(sink.end_tags(), vec!["p", "div"]);
+        assert_eq!(sink.all_text(), "text");
+    }
+
+    #[test]
+    fn test_tag_case_normalization() {
+        let sink = tokenize("<DIV><P>text</P></DIV>");
+        assert_eq!(sink.start_tags(), vec!["div", "p"]);
+        assert_eq!(sink.end_tags(), vec!["p", "div"]);
+    }
+
+    #[test]
+    fn test_self_closing_tag_details() {
+        let sink = tokenize("<br/><hr /><img/>");
+        let self_closings: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { name, self_closing, .. } => Some((name.as_str(), *self_closing)),
+            _ => None,
+        }).collect();
+        assert_eq!(self_closings.len(), 3);
+        for (name, sc) in &self_closings {
+            assert!(sc, "Expected self_closing=true for {}", name);
+        }
+    }
+
+    #[test]
+    fn test_tag_with_double_quoted_attributes() {
+        let sink = tokenize(r#"<div class="main" id="content">"#);
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { name, attrs, .. } => Some((name.clone(), attrs.clone())),
+            _ => None,
+        }).collect();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].0, "div");
+        assert_eq!(tags[0].1.get("class"), Some(&Some("main".to_string())));
+        assert_eq!(tags[0].1.get("id"), Some(&Some("content".to_string())));
+    }
+
+    #[test]
+    fn test_tag_with_single_quoted_attributes() {
+        let sink = tokenize("<div class='main' id='content'>");
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { attrs, .. } => Some(attrs.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(tags[0].get("class"), Some(&Some("main".to_string())));
+        assert_eq!(tags[0].get("id"), Some(&Some("content".to_string())));
+    }
+
+    #[test]
+    fn test_tag_with_unquoted_attributes() {
+        let sink = tokenize("<div class=main>");
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { attrs, .. } => Some(attrs.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(tags[0].get("class"), Some(&Some("main".to_string())));
+    }
+
+    #[test]
+    fn test_tag_with_boolean_attribute() {
+        let sink = tokenize("<input disabled>");
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { attrs, .. } => Some(attrs.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(tags.len(), 1);
+        // Boolean attribute: present but no value
+        assert_eq!(tags[0].get("disabled"), Some(&None));
+    }
+
+    #[test]
+    fn test_tag_with_empty_attribute_value() {
+        let sink = tokenize(r#"<input value="">"#);
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { attrs, .. } => Some(attrs.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(tags[0].get("value"), Some(&Some("".to_string())));
+    }
+
+    #[test]
+    fn test_attribute_case_normalization() {
+        let sink = tokenize(r#"<div CLASS="main">"#);
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { attrs, .. } => Some(attrs.clone()),
+            _ => None,
+        }).collect();
+        assert!(tags[0].contains_key("class"), "attribute name should be lowercased");
+    }
+
+    #[test]
+    fn test_duplicate_attributes() {
+        let (sink, errors) = tokenize_with_errors(r#"<div class="a" class="b">"#);
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { attrs, .. } => Some(attrs.clone()),
+            _ => None,
+        }).collect();
+        // First value wins per HTML5 spec
+        assert_eq!(tags[0].get("class"), Some(&Some("a".to_string())));
+        assert!(errors.iter().any(|e| e.code == "duplicate-attribute"));
+    }
+
+    #[test]
+    fn test_multiple_attributes() {
+        let sink = tokenize(r#"<a href="/" target="_blank" rel="noopener">"#);
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { attrs, .. } => Some(attrs.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(tags[0].get("href"), Some(&Some("/".to_string())));
+        assert_eq!(tags[0].get("target"), Some(&Some("_blank".to_string())));
+        assert_eq!(tags[0].get("rel"), Some(&Some("noopener".to_string())));
+    }
+
+    // ─── Entity decoding tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_entity_in_text_named() {
+        let sink = tokenize("a &amp; b");
+        assert_eq!(sink.all_text(), "a & b");
+    }
+
+    #[test]
+    fn test_entity_in_text_numeric() {
+        let sink = tokenize("a &#60; b");
+        assert_eq!(sink.all_text(), "a < b");
+    }
+
+    #[test]
+    fn test_entity_in_text_hex() {
+        let sink = tokenize("a &#x3C; b");
+        assert_eq!(sink.all_text(), "a < b");
+    }
+
+    #[test]
+    fn test_entity_in_attribute_value() {
+        let sink = tokenize(r#"<a href="?a=1&amp;b=2">"#);
+        let tags: Vec<_> = sink.events.iter().filter_map(|e| match e {
+            TokenEvent::StartTag { attrs, .. } => Some(attrs.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(tags[0].get("href"), Some(&Some("?a=1&b=2".to_string())));
+    }
+
+    #[test]
+    fn test_multiple_entities_in_text() {
+        let sink = tokenize("&lt;div&gt;");
+        assert_eq!(sink.all_text(), "<div>");
+    }
+
+    // ─── Character / text tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_plain_text() {
+        let sink = tokenize("hello world");
+        assert_eq!(sink.all_text(), "hello world");
+    }
+
+    #[test]
+    fn test_text_with_special_chars() {
+        let sink = tokenize("hello < world");
+        // '<' followed by a space triggers an error and emits text
+        // The '<' itself gets emitted as text because it's not a valid tag opener
+        assert!(sink.all_text().contains("hello"));
+    }
+
+    #[test]
+    fn test_null_replacement_in_data() {
+        let (sink, errors) = tokenize_with_errors("a\x00b");
+        assert_eq!(sink.all_text(), "a\u{FFFD}b");
+        assert!(errors.iter().any(|e| e.code == "unexpected-null-character"));
+    }
+
+    #[test]
+    fn test_bom_stripping() {
+        let sink = tokenize("\u{FEFF}hello");
+        assert_eq!(sink.all_text(), "hello");
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let sink = tokenize("");
+        assert!(sink.events.iter().any(|e| matches!(e, TokenEvent::Eof)));
+    }
+
+    // ─── RCDATA / RAWTEXT mode tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_title_rcdata_mode() {
+        let sink = tokenize("<title>hello <b>world</b></title>");
+        assert_eq!(sink.start_tags(), vec!["title"]);
+        assert_eq!(sink.end_tags(), vec!["title"]);
+        // <b> and </b> should NOT be parsed as tags inside <title>
+        let text = sink.all_text();
+        assert!(text.contains("<b>world</b>"), "RCDATA should preserve inner tags as text, got: {:?}", text);
+    }
+
+    #[test]
+    fn test_textarea_rcdata_mode() {
+        let sink = tokenize("<textarea><div>not a tag</div></textarea>");
+        assert_eq!(sink.start_tags(), vec!["textarea"]);
+        assert_eq!(sink.end_tags(), vec!["textarea"]);
+        let text = sink.all_text();
+        assert!(text.contains("<div>not a tag</div>"),
+            "RCDATA should preserve inner tags as text, got: {:?}", text);
+    }
+
+    #[test]
+    fn test_style_rawtext_mode() {
+        let sink = tokenize("<style>.class { color: red; }</style>");
+        assert_eq!(sink.start_tags(), vec!["style"]);
+        assert_eq!(sink.end_tags(), vec!["style"]);
+        let text = sink.all_text();
+        assert!(text.contains(".class { color: red; }"), "RAWTEXT should preserve CSS as text");
+    }
+
+    #[test]
+    fn test_script_rawtext_mode() {
+        // Simple script without < in content
+        let sink = tokenize("<script>var x = 1;</script>");
+        assert_eq!(sink.start_tags(), vec!["script"]);
+        assert_eq!(sink.end_tags(), vec!["script"]);
+        let text = sink.all_text();
+        assert!(text.contains("var x = 1;"), "Script content should be in text, got: {:?}", text);
+    }
+
+    #[test]
+    fn test_script_rawtext_with_less_than() {
+        // Script with < in content
+        let sink = tokenize("<script>var x = 1 < 2;</script>");
+        assert_eq!(sink.start_tags(), vec!["script"]);
+        assert_eq!(sink.end_tags(), vec!["script"]);
+        let text = sink.all_text();
+        assert!(text.contains("var x = 1"), "Script content should be preserved");
+    }
+
+    #[test]
+    fn test_xmp_rawtext_mode() {
+        // xmp uses rawtext mode; inner tags should be preserved as text
+        let sink = tokenize("<xmp><b>bold</b></xmp>");
+        assert_eq!(sink.start_tags(), vec!["xmp"]);
+        assert_eq!(sink.end_tags(), vec!["xmp"]);
+        let text = sink.all_text();
+        assert!(text.contains("<b>bold</b>"), "RAWTEXT should preserve inner HTML as text, got: {:?}", text);
+    }
+
+    // ─── Error reporting tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_eof_in_tag() {
+        let (_, errors) = tokenize_with_errors("<div");
+        assert!(errors.iter().any(|e| e.code == "eof-in-tag"),
+            "Expected 'eof-in-tag' error, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_eof_before_tag_name() {
+        let (_, errors) = tokenize_with_errors("<");
+        assert!(errors.iter().any(|e| e.code == "eof-before-tag-name"),
+            "Expected 'eof-before-tag-name', got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_eof_in_comment() {
+        let (_, errors) = tokenize_with_errors("<!-- unclosed comment");
+        assert!(errors.iter().any(|e| e.code == "eof-in-comment"),
+            "Expected 'eof-in-comment', got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_eof_in_doctype() {
+        let (_, errors) = tokenize_with_errors("<!DOCTYPE");
+        assert!(errors.iter().any(|e| e.code == "eof-in-doctype"),
+            "Expected 'eof-in-doctype', got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_invalid_first_character_of_tag() {
+        let (sink, errors) = tokenize_with_errors("<1abc>");
+        assert!(errors.iter().any(|e| e.code == "invalid-first-character-of-tag-name"),
+            "Expected 'invalid-first-character-of-tag-name', got: {:?}", errors);
+        // The '<' and '1abc>' should be emitted as text
+        let text = sink.all_text();
+        assert!(text.contains("<"), "Should emit '<' as text");
+    }
+
+    #[test]
+    fn test_unexpected_question_mark() {
+        let (_, errors) = tokenize_with_errors("<?xml version='1.0'?>");
+        assert!(errors.iter().any(|e| e.code == "unexpected-question-mark-instead-of-tag-name"),
+            "Expected question mark error, got: {:?}", errors);
+    }
+
+    // ─── Position tracking tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_error_position_single_line() {
+        let (_, errors) = tokenize_with_errors("hello\x00world");
+        assert!(!errors.is_empty());
+        let err = &errors[0];
+        assert_eq!(err.line, Some(1));
+        // Column should be somewhere after 'hello'
+        assert!(err.column.unwrap() > 1, "Column should be > 1, got: {:?}", err.column);
+    }
+
+    #[test]
+    fn test_error_position_multi_line() {
+        let (_, errors) = tokenize_with_errors("line1\nline2\n\x00");
+        assert!(!errors.is_empty());
+        let err = &errors[0];
+        assert_eq!(err.line, Some(3), "Error should be on line 3, got: {:?}", err.line);
+    }
+
+    // ─── Complete HTML document tests ────────────────────────────────────────
+
+    #[test]
+    fn test_complete_document() {
+        let html = "<!DOCTYPE html><html><head><title>Test</title></head><body><p>Hello</p></body></html>";
+        let sink = tokenize(html);
+        let dts = sink.doctypes();
+        assert_eq!(dts.len(), 1);
+        assert_eq!(sink.start_tags(), vec!["html", "head", "title", "body", "p"]);
+        assert_eq!(sink.end_tags(), vec!["title", "head", "p", "body", "html"]);
+    }
+
+    #[test]
+    fn test_document_with_entities_and_comments() {
+        let html = "<!DOCTYPE html><html><body><!-- nav --><p>Hello &amp; world</p></body></html>";
+        let sink = tokenize(html);
+        assert_eq!(sink.comments(), vec![" nav "]);
+        assert!(sink.all_text().contains("Hello & world"));
+    }
+
+    #[test]
+    fn test_mixed_content_complex() {
+        let html = r#"<div id="a"><span class="b">text1</span><br/><span>text2</span></div>"#;
+        let sink = tokenize(html);
+        assert_eq!(sink.start_tags(), vec!["div", "span", "br", "span"]);
+        assert_eq!(sink.end_tags(), vec!["span", "span", "div"]);
+        assert!(sink.all_text().contains("text1"));
+        assert!(sink.all_text().contains("text2"));
+    }
+
+    // ─── Initial state override tests ────────────────────────────────────────
+
+    #[test]
+    fn test_initial_state_rcdata() {
+        let opts = TokenizerOpts {
+            initial_state: Some(TokenizerState::Rcdata),
+            initial_rawtext_tag: Some("title".to_string()),
+            ..Default::default()
+        };
+        let mut tok = Tokenizer::new(Some(opts), false);
+        let mut sink = DetailedSink::new();
+        tok.run("hello <b>not tag</b></title>", &mut sink);
+        // In RCDATA mode, <b> is not parsed as a tag
+        assert!(sink.all_text().contains("<b>not tag</b>"));
+        assert_eq!(sink.end_tags(), vec!["title"]);
+    }
+
+    #[test]
+    fn test_initial_state_rawtext() {
+        let opts = TokenizerOpts {
+            initial_state: Some(TokenizerState::Rawtext),
+            initial_rawtext_tag: Some("style".to_string()),
+            ..Default::default()
+        };
+        let mut tok = Tokenizer::new(Some(opts), false);
+        let mut sink = DetailedSink::new();
+        tok.run("body { margin: 0; }</style>", &mut sink);
+        assert!(sink.all_text().contains("body { margin: 0; }"));
+        assert_eq!(sink.end_tags(), vec!["style"]);
+    }
+
+    // ─── XML coercion tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_xml_coercion_in_tokenizer() {
+        let opts = TokenizerOpts {
+            xml_coercion: true,
+            ..Default::default()
+        };
+        let mut tok = Tokenizer::new(Some(opts), false);
+        let mut sink = DetailedSink::new();
+        tok.run("text\x01more", &mut sink);
+        let text = sink.all_text();
+        assert!(text.contains('\u{FFFD}'), "XML coercion should replace invalid XML chars");
+    }
+
+    #[test]
+    fn test_xml_coercion_comment_in_tokenizer() {
+        let opts = TokenizerOpts {
+            xml_coercion: true,
+            ..Default::default()
+        };
+        let mut tok = Tokenizer::new(Some(opts), false);
+        let mut sink = DetailedSink::new();
+        tok.run("<!-- a--b -->", &mut sink);
+        let comments = sink.comments();
+        assert!(!comments.is_empty());
+        // XML coercion replaces "--" with "- -" in comments
+        assert!(comments[0].contains("- -"), "Expected '- -' but got: {:?}", comments[0]);
+    }
+
+    // ─── CDATA section tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_cdata_section() {
+        let (sink, errors) = tokenize_with_errors("<![CDATA[hello world]]>");
+        // CDATA in HTML content generates an error
+        assert!(errors.iter().any(|e| e.code == "cdata-in-html-content"));
+        assert!(sink.all_text().contains("hello world"));
+    }
+
+    #[test]
+    fn test_cdata_with_angle_brackets() {
+        let (sink, _) = tokenize_with_errors("<![CDATA[<div>not a tag</div>]]>");
+        assert!(sink.all_text().contains("<div>not a tag</div>"));
+    }
+
+    // ─── Bogus comment tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_bogus_comment_from_processing_instruction() {
+        let (sink, _) = tokenize_with_errors("<?xml version='1.0'?>");
+        // PI is treated as a bogus comment
+        assert!(!sink.comments().is_empty());
+    }
+
+    // ─── Edge cases ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_adjacent_tags_no_whitespace() {
+        let sink = tokenize("<a><b><c></c></b></a>");
+        assert_eq!(sink.start_tags(), vec!["a", "b", "c"]);
+        assert_eq!(sink.end_tags(), vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn test_text_between_tags() {
+        let sink = tokenize("before<p>inside</p>after");
+        let text = sink.all_text();
+        assert!(text.contains("before"));
+        assert!(text.contains("inside"));
+        assert!(text.contains("after"));
+    }
+
+    #[test]
+    fn test_empty_end_tag() {
+        let (_, errors) = tokenize_with_errors("</>");
+        assert!(errors.iter().any(|e| e.code == "empty-end-tag"),
+            "Expected 'empty-end-tag', got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_missing_whitespace_between_attributes() {
+        let (sink, errors) = tokenize_with_errors(r#"<div class="a"id="b">"#);
+        assert_eq!(sink.start_tags(), vec!["div"]);
+        assert!(errors.iter().any(|e| e.code == "missing-whitespace-between-attributes"),
+            "Expected missing-whitespace error, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_unexpected_solidus_in_tag() {
+        let (_, errors) = tokenize_with_errors("<div / >");
+        // The '/' in <div / > triggers unexpected-character-after-solidus-in-tag
+        assert!(errors.iter().any(|e| e.code == "unexpected-character-after-solidus-in-tag"),
+            "Expected solidus error, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_only_text_no_tags() {
+        let sink = tokenize("just plain text with no tags at all");
+        assert!(sink.start_tags().is_empty());
+        assert!(sink.end_tags().is_empty());
+        assert_eq!(sink.all_text(), "just plain text with no tags at all");
+    }
+
+    #[test]
+    fn test_deeply_nested() {
+        let sink = tokenize("<a><b><c><d><e>deep</e></d></c></b></a>");
+        assert_eq!(sink.start_tags(), vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(sink.end_tags(), vec!["e", "d", "c", "b", "a"]);
+        assert_eq!(sink.all_text(), "deep");
     }
 }
