@@ -3,5 +3,7 @@ pub mod context;
 pub mod encoding;
 pub mod entities;
 pub mod errors;
+pub mod node;
 pub mod tokenizer;
 pub mod tokens;
+pub mod treebuilder;
