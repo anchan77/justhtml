@@ -253,6 +253,110 @@ pub fn same_node(a: &NodeHandle, b: &NodeHandle) -> bool {
     Rc::ptr_eq(a, b)
 }
 
+// ---------------------------------------------------------------------------
+// High-level node API functions
+// ---------------------------------------------------------------------------
+
+/// Return the node's own text value.
+///
+/// For text nodes this is the node data. For other nodes this is an empty string.
+/// Use `node_to_text()` to get textContent semantics.
+pub fn text_content(node: &NodeHandle) -> String {
+    let data = node.borrow();
+    if data.kind == NodeKind::Text {
+        data.data.as_deref().unwrap_or("").to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Internal helper: recursively collect text from a node tree.
+fn to_text_collect(node: &NodeHandle, parts: &mut Vec<String>, strip: bool) {
+    let data = node.borrow();
+
+    if data.kind == NodeKind::Text {
+        let text = data.data.as_deref().unwrap_or("");
+        if text.is_empty() {
+            return;
+        }
+        if strip {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            parts.push(trimmed.to_string());
+        } else {
+            parts.push(text.to_string());
+        }
+        return;
+    }
+
+    let children: Vec<NodeHandle> = data.children.iter().cloned().collect();
+    let template_content = data.template_content.clone();
+    drop(data);
+
+    for child in &children {
+        to_text_collect(child, parts, strip);
+    }
+
+    if let Some(ref tc) = template_content {
+        to_text_collect(tc, parts, strip);
+    }
+}
+
+/// Return the concatenated text of a node's descendants.
+///
+/// * `separator` - Controls how text nodes are joined (default: a single space).
+/// * `strip` - If true, strips each text node and drops empty segments.
+///
+/// Template element contents are included via `template_content`.
+pub fn node_to_text(node: &NodeHandle, separator: &str, strip: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    to_text_collect(node, &mut parts, strip);
+    if parts.is_empty() {
+        return String::new();
+    }
+    parts.join(separator)
+}
+
+/// Convert a node to an HTML string.
+///
+/// Delegates to `serialize::to_html`.
+pub fn node_to_html(node: &NodeHandle, indent: usize, indent_size: usize, pretty: bool) -> String {
+    crate::serialize::to_html(node, indent, indent_size, pretty)
+}
+
+/// Convert a node to a Markdown representation.
+///
+/// Delegates to `markdown::to_markdown`.
+pub fn node_to_markdown(node: &NodeHandle) -> String {
+    crate::markdown::to_markdown(node)
+}
+
+/// Query a subtree using a CSS selector.
+///
+/// This is a stub implementation that will be completed in Milestone 4
+/// when the selector engine is implemented.
+pub fn node_query(_node: &NodeHandle, _selector: &str) -> Vec<NodeHandle> {
+    // TODO: Implement in Milestone 4 with the selector engine
+    Vec::new()
+}
+
+/// Create a new document-fragment node.
+pub fn new_document_fragment() -> NodeHandle {
+    Rc::new(RefCell::new(NodeData {
+        kind: NodeKind::Document,
+        name: "#document-fragment".to_string(),
+        namespace: String::new(),
+        attrs: HashMap::new(),
+        data: None,
+        children: Vec::new(),
+        parent: None,
+        template_content: None,
+        doctype_data: None,
+    }))
+}
+
 impl fmt::Display for NodeData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
@@ -428,5 +532,171 @@ mod tests {
         assert!(data.doctype_data.is_some());
         let dd = data.doctype_data.as_ref().unwrap();
         assert_eq!(dd.name.as_deref(), Some("html"));
+    }
+
+    // -----------------------------------------------------------------------
+    // text_content tests (ported from test_node.py)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_text_content_text_node() {
+        let node = new_text("Hi");
+        assert_eq!(text_content(&node), "Hi");
+    }
+
+    #[test]
+    fn test_text_content_element_is_empty() {
+        let node = new_element("div", "http://www.w3.org/1999/xhtml", HashMap::new());
+        assert_eq!(text_content(&node), "");
+    }
+
+    #[test]
+    fn test_text_content_comment_is_empty() {
+        let node = new_comment("comment");
+        assert_eq!(text_content(&node), "");
+    }
+
+    #[test]
+    fn test_text_content_none_data() {
+        // TextNode with empty data
+        let node = new_text("");
+        assert_eq!(text_content(&node), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // node_to_text tests (ported from test_node.py)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_text_simple() {
+        let node = new_element("div", "http://www.w3.org/1999/xhtml", HashMap::new());
+        let text = new_text("Hello");
+        append_child(&node, &text);
+        assert_eq!(text_content(&node), "");
+        assert_eq!(text_content(&text), "Hello");
+        assert_eq!(node_to_text(&node, " ", true), "Hello");
+    }
+
+    #[test]
+    fn test_to_text_nested() {
+        let root = new_element("div", "http://www.w3.org/1999/xhtml", HashMap::new());
+        let span = new_element("span", "http://www.w3.org/1999/xhtml", HashMap::new());
+        let text1 = new_text("Hello ");
+        let text2 = new_text("World");
+        append_child(&root, &text1);
+        append_child(&root, &span);
+        append_child(&span, &text2);
+
+        assert_eq!(text_content(&root), "");
+        assert_eq!(text_content(&span), "");
+        assert_eq!(node_to_text(&root, " ", true), "Hello World");
+        assert_eq!(node_to_text(&span, " ", true), "World");
+    }
+
+    #[test]
+    fn test_to_text_matches_textcontent() {
+        let root = new_element("div", "http://www.w3.org/1999/xhtml", HashMap::new());
+        let span = new_element("span", "http://www.w3.org/1999/xhtml", HashMap::new());
+        append_child(&root, &new_text("Hello "));
+        append_child(&root, &span);
+        append_child(&span, &new_text("World"));
+
+        assert_eq!(node_to_text(&root, " ", true), "Hello World");
+        assert_eq!(node_to_text(&span, " ", true), "World");
+        assert_eq!(node_to_text(&root, "", false), "Hello World");
+        assert_eq!(node_to_text(&root, "", true), "HelloWorld");
+    }
+
+    #[test]
+    fn test_to_text_skips_empty_and_whitespace_segments_by_default() {
+        let root = new_element("div", "http://www.w3.org/1999/xhtml", HashMap::new());
+        append_child(&root, &new_text(""));
+        append_child(&root, &new_text("   "));
+        append_child(&root, &new_text("A"));
+        assert_eq!(node_to_text(&root, " ", true), "A");
+    }
+
+    #[test]
+    fn test_to_text_empty_subtree() {
+        let root = new_element("div", "http://www.w3.org/1999/xhtml", HashMap::new());
+        assert_eq!(node_to_text(&root, " ", true), "");
+    }
+
+    #[test]
+    fn test_textnode_to_text_strip_false() {
+        let t = new_text("  A  ");
+        assert_eq!(node_to_text(&t, " ", false), "  A  ");
+        assert_eq!(node_to_text(&t, " ", true), "A");
+    }
+
+    #[test]
+    fn test_to_text_includes_template_content() {
+        let template = new_template("http://www.w3.org/1999/xhtml", HashMap::new());
+        {
+            let data = template.borrow();
+            let tc = data.template_content.as_ref().unwrap();
+            append_child(tc, &new_text("Inside"));
+        }
+        assert_eq!(text_content(&template), "");
+        assert_eq!(node_to_text(&template, " ", true), "Inside");
+    }
+
+    #[test]
+    fn test_to_text_text_node_branch() {
+        let node = new_text("Hi");
+        assert_eq!(node_to_text(&node, " ", true), "Hi");
+    }
+
+    // -----------------------------------------------------------------------
+    // node_to_html tests (ported from test_node.py)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_html_method() {
+        let node = new_element("div", "http://www.w3.org/1999/xhtml", HashMap::new());
+        let output = node_to_html(&node, 0, 2, true);
+        assert!(output.contains("<div>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // node_query stub test (ported from test_node.py)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_query_stub() {
+        let parent = new_element("div", "http://www.w3.org/1999/xhtml", HashMap::new());
+        let child = new_element("span", "http://www.w3.org/1999/xhtml", HashMap::new());
+        append_child(&parent, &child);
+        // Stub returns empty for now (actual implementation in Milestone 4)
+        let results = node_query(&parent, "span");
+        assert!(results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // node_to_markdown tests (ported from test_node.py)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_markdown_method() {
+        let t = new_text("a*b");
+        assert_eq!(node_to_markdown(&t), "a\\*b");
+    }
+
+    #[test]
+    fn test_to_markdown_empty_textnode() {
+        let t = new_text("");
+        assert_eq!(node_to_markdown(&t), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // new_document_fragment tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_new_document_fragment() {
+        let frag = new_document_fragment();
+        let data = frag.borrow();
+        assert_eq!(data.name, "#document-fragment");
+        assert!(data.children.is_empty());
     }
 }
