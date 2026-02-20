@@ -325,11 +325,11 @@ impl TreeBuilder {
     // Parse error reporting
     // -----------------------------------------------------------------------
 
-    fn parse_error(&mut self, code: &str, tag_name: Option<&str>) {
+    pub fn parse_error(&mut self, code: &str, tag_name: Option<&str>) {
         self.parse_error_with_token(code, tag_name, None);
     }
 
-    fn parse_error_with_token(&mut self, code: &str, tag_name: Option<&str>, token: Option<&Token>) {
+    pub fn parse_error_with_token(&mut self, code: &str, tag_name: Option<&str>, token: Option<&Token>) {
         if !self.collect_errors {
             return;
         }
@@ -3840,6 +3840,12 @@ impl TokenSink for TreeBuilder {
 
     fn process_characters(&mut self, data: &str) -> TokenSinkResult {
         self.do_process_characters(data)
+    }
+
+    fn set_token_position(&mut self, line: usize, column: usize, buffer: &str) {
+        self.last_token_line = Some(line);
+        self.last_token_column = Some(column);
+        self.buffer = Some(buffer.to_string());
     }
 }
 

@@ -1556,6 +1556,8 @@ fn state_rcdata_end_tag_name(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> b
                             let attrs = std::collections::HashMap::new();
                             let tag = crate::tokens::Tag::new(TagKind::End, tag_name, attrs, false);
                             tok.flush_text(sink);
+                            tok.record_token_position();
+                            sink.set_token_position(tok.last_token_line, tok.last_token_column, &tok.buffer);
                             sink.process_token(crate::tokens::Token::Tag(tag));
                             tok.state = TokenizerState::Data;
                             tok.rawtext_tag_name = None;
@@ -1735,6 +1737,8 @@ fn state_rawtext_end_tag_name(tok: &mut Tokenizer, sink: &mut dyn TokenSink) -> 
                             let attrs = std::collections::HashMap::new();
                             let tag = crate::tokens::Tag::new(TagKind::End, tag_name, attrs, false);
                             tok.flush_text(sink);
+                            tok.record_token_position();
+                            sink.set_token_position(tok.last_token_line, tok.last_token_column, &tok.buffer);
                             sink.process_token(crate::tokens::Token::Tag(tag));
                             tok.state = TokenizerState::Data;
                             tok.rawtext_tag_name = None;
@@ -2115,6 +2119,8 @@ fn state_script_data_escaped_end_tag_name(tok: &mut Tokenizer, sink: &mut dyn To
                         tok.flush_text(sink);
                         let attrs = std::collections::HashMap::new();
                         let tag = crate::tokens::Tag::new(TagKind::End, tag_name, attrs, false);
+                        tok.record_token_position();
+                        sink.set_token_position(tok.last_token_line, tok.last_token_column, &tok.buffer);
                         sink.process_token(crate::tokens::Token::Tag(tag));
                         tok.state = TokenizerState::Data;
                         tok.rawtext_tag_name = None;

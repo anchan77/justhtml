@@ -22,6 +22,10 @@ pub trait TokenSink {
 
     /// Process character data (may be called multiple times with adjacent text).
     fn process_characters(&mut self, data: &str) -> TokenSinkResult;
+
+    /// Called by the tokenizer before emitting each token to provide position
+    /// info and the full source buffer. The default implementation does nothing.
+    fn set_token_position(&mut self, _line: usize, _column: usize, _buffer: &str) {}
 }
 
 /// Tokenizer configuration options.
@@ -151,6 +155,10 @@ pub struct Tokenizer {
     pos: usize,
     length: usize,
     reconsume: bool,
+    /// Tracks whether the last `get_char()` returned `None` (EOF).
+    /// Needed so that `reconsume_current()` after EOF correctly returns `None`
+    /// instead of the last consumed character.
+    at_eof: bool,
 
     // State
     state: TokenizerState,
@@ -211,6 +219,7 @@ impl Tokenizer {
             pos: 0,
             length: 0,
             reconsume: false,
+            at_eof: false,
             state: initial_state,
             current_tag_kind: TagKind::Start,
             current_tag_name: String::new(),
@@ -265,6 +274,7 @@ impl Tokenizer {
         self.length = self.buffer.len();
         self.pos = 0;
         self.reconsume = false;
+        self.at_eof = false;
         self.text_start_pos = 0;
     }
 
@@ -300,6 +310,11 @@ impl Tokenizer {
     pub(crate) fn get_char(&mut self) -> Option<char> {
         if self.reconsume {
             self.reconsume = false;
+            // If the previous get_char() returned None (EOF), reconsuming
+            // must also return None to avoid an infinite loop.
+            if self.at_eof {
+                return None;
+            }
             if self.pos > 0 {
                 let prev_pos = self.prev_char_pos();
                 return self.buffer[prev_pos..].chars().next();
@@ -308,9 +323,11 @@ impl Tokenizer {
         }
 
         if self.pos >= self.length {
+            self.at_eof = true;
             return None;
         }
 
+        self.at_eof = false;
         let ch = self.buffer[self.pos..].chars().next()?;
         self.pos += ch.len_utf8();
         Some(ch)
@@ -390,6 +407,7 @@ impl Tokenizer {
             self.record_token_position();
         }
 
+        sink.set_token_position(self.last_token_line, self.last_token_column, &self.buffer);
         sink.process_characters(&data)
     }
 
@@ -475,6 +493,7 @@ impl Tokenizer {
         // Flush text before emitting tag
         self.flush_text(sink);
 
+        sink.set_token_position(self.last_token_line, self.last_token_column, &self.buffer);
         let result = sink.process_token(Token::Tag(tag));
 
         // Check if we should switch to rawtext/rcdata mode.
@@ -531,6 +550,7 @@ impl Tokenizer {
             data
         };
 
+        sink.set_token_position(self.last_token_line, self.last_token_column, &self.buffer);
         sink.process_token(Token::Comment(CommentToken::new(data)));
     }
 
@@ -547,12 +567,14 @@ impl Tokenizer {
         };
         self.current_doctype_force_quirks = false;
 
+        sink.set_token_position(self.last_token_line, self.last_token_column, &self.buffer);
         sink.process_token(Token::Doctype(DoctypeToken::new(doctype)));
     }
 
     /// Emit EOF token.
     pub(crate) fn emit_eof(&mut self, sink: &mut dyn TokenSink) {
         self.flush_text(sink);
+        sink.set_token_position(self.last_token_line, self.last_token_column, &self.buffer);
         sink.process_token(Token::EOF(EOFToken));
         self.is_done = true;
     }
