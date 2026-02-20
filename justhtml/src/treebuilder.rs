@@ -3751,32 +3751,50 @@ impl TreeBuilder {
     }
 
     /// Finalize the tree after all tokens have been processed.
-    pub fn finish(&mut self) {
-        // Populate selectedcontent for <select> elements
-        let root = if self.fragment_context.is_some() {
-            Rc::clone(&self.document)
-        } else {
-            Rc::clone(&self.document)
-        };
-        self.populate_selectedcontent(&root);
-
-        // For fragment parsing, extract children from html (or context element) into document
+    /// Returns the root node (document or document-fragment).
+    pub fn finish(&mut self) -> NodeHandle {
+        // For fragment parsing, extract children from html wrapper into document-fragment
         if self.fragment_context.is_some() {
-            // The document is already a #document-fragment, children are under html
-            // Move children of the root element to the document-fragment
             let doc = Rc::clone(&self.document);
-            let children: Vec<NodeHandle> = doc.borrow().children.iter().map(Rc::clone).collect();
-            if let Some(html_node) = children.first() {
-                let html_children: Vec<NodeHandle> = html_node.borrow().children.iter().map(Rc::clone).collect();
-                // Clear document children
-                doc.borrow_mut().children.clear();
-                // Move html's children to document-fragment directly
+            let doc_children: Vec<NodeHandle> = doc.borrow().children.iter().map(Rc::clone).collect();
+
+            // Note: children[0] is always the "html" element created in setup_fragment_parsing
+            if let Some(html_node) = doc_children.first() {
+                // Handle fragment_context_element: if present and parented under root,
+                // reparent its children to root first, then remove the context element
+                if let Some(ref ctx_elem) = self.fragment_context_element {
+                    let ctx_parent = get_parent(ctx_elem);
+                    let is_child_of_root = ctx_parent
+                        .as_ref()
+                        .map_or(false, |p| Rc::ptr_eq(p, html_node));
+                    if is_child_of_root {
+                        let ctx_children: Vec<NodeHandle> =
+                            ctx_elem.borrow().children.iter().map(Rc::clone).collect();
+                        for child in ctx_children {
+                            remove_child(ctx_elem, &child);
+                            append_child(html_node, &child);
+                        }
+                        remove_child(html_node, ctx_elem);
+                    }
+                }
+
+                // Move all of html's children to the document-fragment
+                let html_children: Vec<NodeHandle> =
+                    html_node.borrow().children.iter().map(Rc::clone).collect();
                 for child in html_children {
                     remove_child(html_node, &child);
                     append_child(&doc, &child);
                 }
+                // Remove the html wrapper from the document
+                remove_child(&doc, html_node);
             }
         }
+
+        // Populate selectedcontent for <select> elements
+        let root = Rc::clone(&self.document);
+        self.populate_selectedcontent(&root);
+
+        Rc::clone(&self.document)
     }
 }
 
