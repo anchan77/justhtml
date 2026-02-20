@@ -24,9 +24,10 @@ pub mod treebuilder;
 
 use std::fmt;
 
+// Re-export core types for public API consumption.
 pub use context::FragmentContext;
-pub use node::{NodeHandle, NodeData, NodeKind};
-pub use tokens::ParseError;
+pub use node::{NodeHandle, NodeData, NodeKind, WeakNodeHandle, DoctypeData};
+pub use tokens::{ParseError, Tag, TagKind, CharacterTokens, CommentToken, Token};
 pub use treebuilder::{InsertionMode, TreeBuilder};
 
 use encoding::decode_html;
