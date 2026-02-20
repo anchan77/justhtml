@@ -326,11 +326,42 @@ impl TreeBuilder {
     // -----------------------------------------------------------------------
 
     fn parse_error(&mut self, code: &str, tag_name: Option<&str>) {
+        self.parse_error_with_token(code, tag_name, None);
+    }
+
+    fn parse_error_with_token(&mut self, code: &str, tag_name: Option<&str>, token: Option<&Token>) {
         if !self.collect_errors {
             return;
         }
         let line = self.last_token_line;
-        let column = self.last_token_column;
+        let mut column = self.last_token_column;
+        let mut end_column: Option<usize> = None;
+
+        // Calculate start and end columns based on token type for precise highlighting
+        // Note: column from tokenizer points AFTER the last character (0-indexed)
+        if let Some(Token::Tag(tag)) = token {
+            let mut tag_len = tag.name.len() + 2; // < + name + >
+            if tag.kind == TagKind::End {
+                tag_len += 1; // </name>
+            }
+            // Add attribute lengths
+            for (attr_name, attr_value) in &tag.attrs {
+                tag_len += 1 + attr_name.len(); // space + name
+                if let Some(ref val) = attr_value {
+                    tag_len += 1 + 2 + val.len(); // = + "value"
+                }
+            }
+            if tag.self_closing {
+                tag_len += 1; // /
+            }
+            // column points after >, so start is column - tag_len + 1 (for 1-indexed)
+            if let Some(col) = column {
+                let start_column = col.saturating_sub(tag_len) + 1;
+                column = Some(start_column);
+                end_column = Some(start_column + tag_len);
+            }
+        }
+
         let message = generate_error_message(code, tag_name);
         let source_html = self.buffer.clone();
         self.errors.push(ParseError::new(
@@ -339,7 +370,7 @@ impl TreeBuilder {
             column,
             Some(&message),
             source_html,
-            None,
+            end_column,
         ));
     }
 
@@ -1607,9 +1638,9 @@ impl TreeBuilder {
             }
             Token::Tag(ref tag) => {
                 if tag.kind == TagKind::Start {
-                    self.parse_error("expected-doctype-but-got-start-tag", Some(&tag.name));
+                    self.parse_error_with_token("expected-doctype-but-got-start-tag", Some(&tag.name), Some(&token));
                 } else {
-                    self.parse_error("expected-doctype-but-got-end-tag", Some(&tag.name));
+                    self.parse_error_with_token("expected-doctype-but-got-end-tag", Some(&tag.name), Some(&token));
                 }
                 self.quirks_mode = "quirks".to_string();
                 reprocess(InsertionMode::BeforeHtml, token)
@@ -2538,7 +2569,7 @@ impl TreeBuilder {
                 None
             }
             "br" => {
-                self.parse_error("unexpected-end-tag", Some(name));
+                self.parse_error_with_token("unexpected-end-tag", Some(name), Some(token));
                 let br_tag = Tag::new_start("br");
                 self.close_p_element();
                 self.reconstruct_active_formatting_elements();
