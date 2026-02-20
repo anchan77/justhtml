@@ -655,4 +655,233 @@ mod tests {
         assert_eq!(error.column, Some(5));
         assert!(error.end_column.is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Additional tests ported from test_errors.py
+    // -----------------------------------------------------------------------
+
+    // --- TestErrorCollection additional tests ---
+
+    /// Ported from test_errors.py: TestErrorCollection.test_error_code_is_string
+    #[test]
+    fn test_error_code_is_string() {
+        let opts = JustHTMLOptions {
+            collect_errors: true,
+            ..Default::default()
+        };
+        let doc = JustHTML::parse("<p>\x00</p>", opts);
+        assert!(!doc.errors.is_empty());
+        let error = &doc.errors[0];
+        assert!(!error.code.is_empty());
+    }
+
+    // --- TestParseError additional tests ---
+
+    /// Ported from test_errors.py: TestParseError.test_parse_error_repr
+    #[test]
+    fn test_parse_error_repr() {
+        let error = ParseError::new("test-error", Some(1), Some(5), None, None, None);
+        let repr = format!("{:?}", error);
+        assert!(repr.contains("test-error"), "Debug repr should contain error code");
+        // Rust's Debug format uses field names like `line: Some(1)` or `column: Some(5)`
+        assert!(repr.contains("1"), "Debug repr should contain line number, got: {}", repr);
+        assert!(repr.contains("5"), "Debug repr should contain column number, got: {}", repr);
+    }
+
+    /// Ported from test_errors.py: TestParseError.test_parse_error_no_location (repr part)
+    #[test]
+    fn test_parse_error_no_location_repr() {
+        let error = ParseError::new("test-error", None, None, None, None, None);
+        let repr = format!("{:?}", error);
+        // Without location, line and column should be None
+        assert!(repr.contains("None"), "Debug repr should contain None for line/column");
+    }
+
+    /// Ported from test_errors.py: TestParseError.test_parse_error_no_location (Display part)
+    #[test]
+    fn test_parse_error_no_location_display() {
+        let error = ParseError::new("test-error", None, None, None, None, None);
+        assert_eq!(format!("{}", error), "test-error");
+    }
+
+    /// Ported from test_errors.py: TestParseError.test_parse_error_no_location_with_message (repr check)
+    #[test]
+    fn test_parse_error_no_location_with_message_repr() {
+        let error = ParseError::new("test-error", None, None, Some("This is a test error"), None, None);
+        let repr = format!("{:?}", error);
+        assert!(repr.contains("test-error"));
+        // line and column should be None
+        assert!(repr.contains("None"));
+    }
+
+    // --- TestTreeBuilderParseErrorWithTokens additional tests ---
+
+    /// Ported from test_errors.py: TestTreeBuilderParseErrorWithTokens.test_parse_error_with_end_tag_token
+    #[test]
+    fn test_parse_error_with_end_tag_token() {
+        let mut builder = TreeBuilder::new(None, false, true);
+        builder.last_token_line = Some(1);
+        builder.last_token_column = Some(6); // After '>' of </div>
+
+        use tokens::{Tag, TagKind, Token};
+        let tag = Tag::new(TagKind::End, "div".to_string(), HashMap::new(), false);
+        let token = Token::Tag(tag);
+
+        builder.parse_error_with_token("test-error", Some("div"), Some(&token));
+
+        assert_eq!(builder.errors.len(), 1);
+        let error = &builder.errors[0];
+        // Tag length: </div> = 6 chars
+        // Start = 6 - 6 + 1 = 1
+        assert_eq!(error.column, Some(1));
+        assert_eq!(error.end_column, Some(7));
+    }
+
+    /// Ported from test_errors.py: TestTreeBuilderParseErrorWithTokens.test_parse_error_with_self_closing_tag
+    #[test]
+    fn test_parse_error_with_self_closing_tag() {
+        let mut builder = TreeBuilder::new(None, false, true);
+        builder.last_token_line = Some(1);
+
+        use tokens::{Tag, TagKind, Token};
+        let mut attrs = HashMap::new();
+        attrs.insert("src".to_string(), Some("test.jpg".to_string()));
+        let tag = Tag::new(TagKind::Start, "img".to_string(), attrs, true);
+        let token = Token::Tag(tag);
+        // <img src="test.jpg"/> = 21 chars
+        let tag_len = 21;
+        builder.last_token_column = Some(tag_len);
+
+        builder.parse_error_with_token("test-error", Some("img"), Some(&token));
+
+        assert_eq!(builder.errors.len(), 1);
+        let error = &builder.errors[0];
+        assert_eq!(error.column, Some(1));
+        assert_eq!(error.end_column, Some(tag_len + 1));
+    }
+
+    // --- TestTokenBasedErrorHighlighting strengthened tests ---
+
+    /// Ported from test_errors.py: TestTokenBasedErrorHighlighting.test_tag_token_start_tag
+    /// Strengthened version with exact column assertions.
+    #[test]
+    fn test_tag_token_start_tag_exact_columns() {
+        let opts = JustHTMLOptions {
+            collect_errors: true,
+            ..Default::default()
+        };
+        let doc = JustHTML::parse("<html>", opts);
+        // <html> without doctype should produce exactly 1 error
+        assert!(!doc.errors.is_empty(), "Expected errors for <html> without doctype");
+        let error = &doc.errors[0];
+        // Should highlight full <html> tag: column=1, end_column=7
+        assert_eq!(error.column, Some(1), "Start column should be 1");
+        assert_eq!(error.end_column, Some(7), "End column should be 7 for <html>");
+    }
+
+    /// Ported from test_errors.py: TestTokenBasedErrorHighlighting.test_tag_token_end_tag
+    /// Strengthened version checking </br> highlighting.
+    #[test]
+    fn test_end_tag_br_exact_highlighting() {
+        let opts = JustHTMLOptions {
+            collect_errors: true,
+            ..Default::default()
+        };
+        let doc = JustHTML::parse("<html></br></html>", opts);
+        // </br> is treated as error (should be <br>)
+        let errors_with_end_col: Vec<_> = doc.errors.iter()
+            .filter(|e| e.end_column.is_some())
+            .collect();
+        assert!(!errors_with_end_col.is_empty(), "Should have errors with end_column set");
+        // The </br> error should span 5 characters
+        let br_errors: Vec<_> = doc.errors.iter()
+            .filter(|e| e.code.contains("unexpected-end-tag") || e.code.contains("br"))
+            .collect();
+        for err in &br_errors {
+            if let (Some(col), Some(end_col)) = (err.column, err.end_column) {
+                assert_eq!(end_col - col, 5, "</br> is 5 chars, expected end_col - col == 5");
+            }
+        }
+    }
+
+    // --- TestStrictMode additional tests ---
+
+    /// Ported from test_errors.py: TestStrictMode.test_strict_mode_valid_html
+    /// Verify that in strict mode, valid HTML produces empty errors list.
+    #[test]
+    fn test_strict_mode_valid_html_empty_errors() {
+        let result = JustHTML::parse_strict(
+            "<!DOCTYPE html><html><head><title>Test</title></head><body></body></html>",
+            Default::default(),
+        );
+        assert!(result.is_ok());
+        let doc = result.unwrap();
+        assert!(doc.errors.is_empty(), "Valid HTML should have no errors in strict mode");
+    }
+
+    // --- format_with_source tests (Rust equivalent of as_exception tests) ---
+
+    /// Ported from test_errors.py: TestParseError.test_parse_error_as_exception_no_location
+    /// In Rust we test format_with_source instead of as_exception.
+    #[test]
+    fn test_format_with_source_no_location() {
+        let error = ParseError::new("test-error", None, None, Some("Test error message"), None, None);
+        let formatted = error.format_with_source();
+        assert_eq!(formatted, "Test error message");
+    }
+
+    /// Ported from test_errors.py: TestParseError.test_parse_error_as_exception_with_location
+    #[test]
+    fn test_format_with_source_with_location() {
+        let html = "<html>\n<body>\n  <div></div>\n</body>".to_string();
+        let error = ParseError::new(
+            "test-error", Some(3), Some(3),
+            Some("Unexpected div"),
+            Some(html), None,
+        );
+        let formatted = error.format_with_source();
+        assert!(formatted.contains("line 3"), "Should reference line 3, got: {}", formatted);
+        assert!(formatted.contains("<div></div>"), "Should show the error line");
+        assert!(formatted.contains("^"), "Should have caret marker");
+    }
+
+    /// Ported from test_errors.py: TestParseError.test_parse_error_as_exception_invalid_line
+    #[test]
+    fn test_format_with_source_invalid_line() {
+        let html = "<html>".to_string();
+        let error = ParseError::new(
+            "test-error", Some(99), Some(1),
+            Some("test-error"),
+            Some(html), None,
+        );
+        let formatted = error.format_with_source();
+        // Invalid line number should fall back to just the message
+        assert_eq!(formatted, "test-error");
+    }
+
+    /// Ported from test_errors.py: TestParseError.test_parse_error_as_exception_no_tag_start_found
+    #[test]
+    fn test_format_with_source_no_source_html() {
+        let error = ParseError::new(
+            "test-error", Some(1), Some(10),
+            Some("Error without source"),
+            None, None,
+        );
+        let formatted = error.format_with_source();
+        // No source_html → just returns message
+        assert_eq!(formatted, "Error without source");
+    }
+
+    /// Test ParseError with end_column field (ported from test_parse_error_with_end_column_from_token)
+    #[test]
+    fn test_parse_error_end_column_stored() {
+        let error = ParseError::new(
+            "test-error", Some(1), Some(13),
+            Some("Test error on div tag"),
+            Some("<html><body><div>text</div></body></html>".to_string()),
+            Some(18), // end_column
+        );
+        assert_eq!(error.column, Some(13));
+        assert_eq!(error.end_column, Some(18));
+    }
 }
