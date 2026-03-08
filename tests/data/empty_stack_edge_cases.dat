@@ -1,0 +1,48 @@
+#data
+<!><svg><th><title><n><select><td>
+#errors
+#document
+| <!--  -->
+| <html>
+|   <head>
+|   <body>
+|     <svg svg>
+|       <svg th>
+|         <svg title>
+|           <n>
+|             <select>
+|   <td>
+
+
+#data
+<svg><slot><select/e><title/a><select><select></slot></select>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <svg svg>
+|       <svg slot>
+|         <svg select>
+|           e=""
+|           <svg title>
+|             a=""
+|             <select>
+
+
+#data
+<svg><tr><title><section
+><math><p><tr>>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <svg svg>
+|       <svg tr>
+|         <svg title>
+|           <section>
+|             <math math>
+|             <p>
+|   <tr>
+|     ">"

@@ -1,0 +1,183 @@
+#data
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//" "http://www.w3.org/TR/html4/loose.dtd">
+#errors
+#document
+| <!DOCTYPE html "-//W3C//DTD HTML 4.01 Transitional//" "http://www.w3.org/TR/html4/loose.dtd">
+| <html>
+|   <head>
+|   <body>
+
+
+#data
+<math><mi>\x0ctext</mi></math>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <math math>
+|       <math mi>
+|         "text"
+
+
+#data
+<head></head></template>text
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     "text"
+
+
+#data
+<dl><dd>x</dd></dl>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <dl>
+|       <dd>
+|         "x"
+
+
+#data
+<table><caption><!--comment--></caption></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <caption>
+|         <!-- comment -->
+
+
+#data
+<select>\x0ctext</select>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <select>
+|       "text"
+
+
+#data
+<frameset></frameset></frameset>
+#errors
+#document
+| <html>
+|   <head>
+|   <frameset>
+
+
+
+#data
+<table><caption><table></table></caption></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <caption>
+|     <table>
+
+
+#data
+<table>\x00</table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+
+
+#data
+<table><td><!-- comment in cell --></td></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             <!--  comment in cell  -->
+
+
+#data
+<head></head>\x00
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+
+
+#data
+<table>\x0c</table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+
+
+#data
+<select></regularitem>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <select>
+
+
+#data
+<div><select></div>text
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       <select>
+|         "text"
+
+
+#data
+<figure><frameset><h1><aside><figcaption><html><frameset>
+#errors
+#document
+| <html>
+|   <head>
+|   <frameset>
+
+
+#data
+<head><noscript><!DOCTYPE html></noscript>
+#errors
+#script-off
+#document
+| <html>
+|   <head>
+|     <noscript>
+|   <body>
+
+
+#data
+<head><noscript></p></noscript>
+#errors
+#script-off
+#document
+| <html>
+|   <head>
+|     <noscript>
+|   <body>
