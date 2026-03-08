@@ -1,0 +1,45 @@
+#data
+#xml-coercion
+<!-- normal comment -->
+#errors
+#document
+| <!--  normal comment  -->
+| <html>
+|   <head>
+|   <body>
+
+
+#data
+#xml-coercion
+<div>normal text</div>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       "normal text"
+
+
+#data
+#xml-coercion
+<div>über</div>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       "über"
+
+
+#data
+#xml-coercion
+<div>über</div>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       "über "
